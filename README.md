@@ -58,6 +58,7 @@ Two operational rules learned the hard way:
 
 | var | purpose |
 |---|---|
+| `MATE_ALLOWED_NUMBERS` | **required** for `dev`/`start`: comma-separated E.164 numbers allowed to call in (e.g. `+14055551234`). The worker refuses to start without it, and any SIP caller not on the list is hung up on before Mate says a word. |
 | `LIVEKIT_URL` / `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | LiveKit Cloud project the worker registers with |
 | `TELNYX_API_KEY` | Telnyx API (number/trunk management) |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | Telegram bridge (below) |
@@ -85,7 +86,32 @@ infra README); the live path uses **LiveKit Cloud SIP**:
 3. Run the worker (`... agent dev`). It registers with the Cloud project;
    inbound calls dispatch to it automatically.
 
-To restrict who can call in, set `AllowedNumbers` on the inbound trunk.
+Also set `AllowedNumbers` on the inbound trunk to the same list as
+`MATE_ALLOWED_NUMBERS` — that rejects unknown callers before a room is even
+dispatched. The worker enforces its own allowlist regardless, so a missed
+trunk setting is not an open door.
+
+## Threat model
+
+Read this before pointing a phone number at your terminal:
+
+- **The caller allowlist is the only boundary against a hostile caller.**
+  The confirmation rail exists to catch lossy *transcription*, not
+  attackers — a hostile caller happily says "yes" to their own staged
+  action. Everything hinges on who can get a session.
+- **Caller ID is not cryptographic identity.** It is asserted by the
+  originating carrier, and VoIP origination lets anyone assert anything.
+  The allowlist stops strangers who find the DID; it does not stop a
+  targeted attacker who knows both your DID and an allowed number and
+  spoofs it. If that is in your threat model, don't deploy this as-is (a
+  spoken-PIN second factor is on the wishlist).
+- **The destructive-action regex (`safety.py`) is a heuristic, not a
+  security boundary.** It decides which TUI approvals get the extra
+  spoken-confirmation rail; a prompt it fails to flag goes through on one
+  utterance. Treat it as a seatbelt for the legitimate user.
+- A caller who passes the allowlist can drive coding agents that run
+  with your user account's full permissions. There is no sandbox beyond
+  whatever the agents themselves enforce.
 
 ## How Mate works
 
@@ -223,6 +249,7 @@ other files).
 | `folders.py` | folder-name → path resolution for `spawn_in_folder` |
 | `transcripts.py` | reading claude session transcripts for `agent_report` |
 | `safety.py` | transcript approval / veto detection for the rail |
+| `allowlist.py` | caller allowlist: normalization + fail-closed matching |
 | `notify.py` | Telegram send helper |
 | `telegram_bridge.py` | standalone phone↔fleet daemon |
 | `scripts/smoke_llm.py` | quick local-LLM sanity check |

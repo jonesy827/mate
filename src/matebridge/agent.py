@@ -16,9 +16,11 @@ import json
 import logging
 import os
 import re
+import sys
 import time
 
 import httpx
+from livekit import api as lk_api
 from livekit.agents import (
     Agent,
     AgentSession,
@@ -30,6 +32,8 @@ from livekit.agents import (
 )
 from livekit.plugins import openai, silero
 
+from . import notify
+from .allowlist import ENV_VAR, allowed_callers, is_allowed, sip_caller
 from .folders import KnownAgents, resolve_folder, speakable_path
 from .herdr_client import HerdrClient, HerdrError
 from .safety import approves_send, is_destructive
@@ -751,6 +755,39 @@ async def entrypoint(ctx: JobContext):
             f"(llm={LLM_URL} stt={STT_URL} tts={TTS_URL} "
             f"herdr={HerdrClient().sock_path})")
 
+    await ctx.connect()
+
+    # Caller gate. Only SIP participants (they carry sip.phoneNumber) are
+    # screened — console/playground participants already authenticated with
+    # a LiveKit token. Fail-closed: an empty allowlist rejects every phone
+    # caller. This is the only boundary against a hostile caller; the
+    # confirmation rail guards against transcription error, not attackers.
+    allowed = allowed_callers()
+
+    async def _reject_call(caller: str) -> None:
+        logger.warning("blocked call from %s: not in %s", caller, ENV_VAR)
+        await notify.send_telegram(f"mate: blocked call from {caller}")
+        try:
+            await ctx.api.room.delete_room(
+                lk_api.DeleteRoomRequest(room=ctx.room.name))
+        except Exception:  # noqa: BLE001 - room may already be gone
+            logger.exception("could not delete room for blocked caller")
+
+    def _screen_late_joiner(participant) -> None:
+        caller = sip_caller(participant.attributes)
+        if caller is not None and not is_allowed(caller, allowed):
+            asyncio.create_task(_reject_call(caller))
+
+    # The SIP caller is normally already in the room when the job starts
+    # (the dispatch rule created the room for them) — reject before the
+    # session ever opens its mouth. The event handler covers stragglers.
+    for p in list(ctx.room.remote_participants.values()):
+        caller = sip_caller(p.attributes)
+        if caller is not None and not is_allowed(caller, allowed):
+            await _reject_call(caller)
+            return
+    ctx.room.on("participant_connected", _screen_late_joiner)
+
     herdr = HerdrClient()
     session = AgentSession(
         vad=silero.VAD.load(),
@@ -930,5 +967,18 @@ async def entrypoint(ctx: JobContext):
     await session.say(f"G'day mate. {fleet}. What do you need?")
 
 
+def _require_allowlist(argv: list[str], env=None) -> None:
+    """Refuse to run a phone-facing worker (dev/start) without a caller
+    allowlist. console mode has no SIP path and is exempt."""
+    if not {"dev", "start"} & set(argv[1:]):
+        return
+    if not allowed_callers(env):
+        raise SystemExit(
+            f"{ENV_VAR} is not set (or empty). Refusing to take phone calls "
+            "without a caller allowlist. Put a comma-separated E.164 list in "
+            ".env, e.g.  MATE_ALLOWED_NUMBERS=+14055551234")
+
+
 if __name__ == "__main__":
+    _require_allowlist(sys.argv)
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
