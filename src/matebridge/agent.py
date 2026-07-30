@@ -35,7 +35,7 @@ from livekit.plugins import openai, silero
 from . import notify
 from .allowlist import ENV_VAR, allowed_callers, is_allowed, sip_caller
 from .folders import KnownAgents, resolve_folder, speakable_path
-from .herdr_client import HerdrClient, HerdrError
+from .herdr_client import HerdrClient, HerdrError, protocol_note
 from .safety import approves_send, is_destructive
 from .transcripts import claude_transcript_path, read_transcript_replies
 
@@ -738,8 +738,14 @@ async def check_endpoints() -> dict[str, str | None]:
             except Exception as e:  # noqa: BLE001 - report anything as down
                 errors[name] = f"{type(e).__name__}: {e}"
     try:
-        await HerdrClient().call("ping")
+        pong = await HerdrClient().call("ping")
         errors["herdr"] = None
+        note = protocol_note(pong)
+        if note:
+            logger.warning(note)
+        else:
+            logger.info("herdr %s (protocol %s)",
+                        pong.get("version"), pong.get("protocol"))
     except Exception as e:  # noqa: BLE001
         errors["herdr"] = f"{type(e).__name__}: {e}"
     return errors
