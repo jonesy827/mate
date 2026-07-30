@@ -16,7 +16,7 @@ import json
 import logging
 import os
 import re
-from pathlib import Path
+import time
 
 import httpx
 from livekit.agents import (
@@ -30,8 +30,10 @@ from livekit.agents import (
 )
 from livekit.plugins import openai, silero
 
+from .folders import KnownAgents, resolve_folder, speakable_path
 from .herdr_client import HerdrClient, HerdrError
 from .safety import approves_send, is_destructive
+from .transcripts import claude_transcript_path, read_transcript_replies
 
 logger = logging.getLogger("matebridge")
 
@@ -48,36 +50,10 @@ TTS_VOICE = os.environ.get("TTS_VOICE", "af_heart")
 # between subscriptions.
 WATCH_RESUBSCRIBE_SECS = 30.0
 
-# Claude Code writes one JSONL transcript per session under
-# ~/.claude/projects/<munged-cwd>/<session-id>.jsonl. herdr's integration hook
-# reports the session id + cwd, which is enough to find it.
-CLAUDE_PROJECTS = Path(os.path.expanduser("~/.claude/projects"))
-
-
-def claude_transcript_path(cwd: str, session_id: str) -> Path:
-    munged = re.sub(r"[^A-Za-z0-9-]", "-", cwd)
-    return CLAUDE_PROJECTS / munged / f"{session_id}.jsonl"
-
-
-def read_transcript_replies(path: Path, count: int) -> list[str]:
-    """Last `count` assistant text messages from a Claude Code transcript."""
-    texts: list[str] = []
-    with open(path, encoding="utf-8") as fh:
-        for line in fh:
-            try:
-                entry = json.loads(line)
-            except ValueError:
-                continue
-            if entry.get("type") != "assistant":
-                continue
-            for block in entry.get("message", {}).get("content", []):
-                if (isinstance(block, dict) and block.get("type") == "text"
-                        and block.get("text", "").strip()):
-                    texts.append(block["text"])
-    return texts[-count:]
-
 INSTRUCTIONS = """You are Mate, a hands-free voice assistant supervising a fleet of
 coding agents in herdr. The user is often driving and cannot look at a screen.
+Call the user "mate" — greet them with it and drop it in naturally, though not
+in every single sentence.
 
 Voice output: plain text only — no markdown, lists, code blocks, or emoji. One to
 three short sentences unless asked for more. Vary your acknowledgments; never
@@ -90,22 +66,165 @@ this turn. You cannot cancel, undo, or stop anything already sent — if asked t
 say so and offer to send the agent a correcting message. If a tool returns
 ERROR, tell the user plainly what failed.
 
-Messaging an agent is a two-step rail. tell_agent and spawn_task only STAGE:
-read the staged message back to the user word for word, ask whether to send it,
-and stop. Only after the user replies, call send_staged. If it returns NOT SENT
-that is normal, not an error — ask explicitly "should I send it?" and call
-send_staged again after they answer. If the user declines, call discard_staged.
-After a message is delivered, NEVER poll or re-check on your own. Quick
-question: call wait_for_agent once. Anything longer: tell the user you'll be
-notified when it finishes — you will be, automatically.
+When asked for status or "how is it going" on an agent, never answer from the
+last thing you heard: call fleet_status, then agent_report with messages=2 or
+more for that agent. If those replies still leave it unclear what the project
+or task actually is, call agent_report again with more messages (up to 5)
+before answering. Lead with what it is working on, then where it stands.
+
+Messaging an agent is a two-step rail while guardrails are ON (the default).
+tell_agent and spawn_task only STAGE: read the staged message back to the user
+word for word, ask whether to send it, and stop. Only after the user replies,
+call send_staged. If it returns NOT SENT that is normal, not an error — ask
+explicitly "should I send it?" and call send_staged again after they answer. If
+the user declines, call discard_staged. After a message is delivered, NEVER
+poll or re-check on your own. Quick question: call wait_for_agent once.
+Anything longer: tell the user you'll be notified when it finishes — you will
+be, automatically.
+
+Spawning a new agent: default to spawn_in_folder with the user's spoken
+folder name — code resolves the real path and speaks the confirmation for
+you, so after calling it say nothing until the user answers, then call
+send_staged or discard_staged. Folders the user confirmed before get a short
+confirmation automatically. Use spawn_task only when the user explicitly
+asks for a worktree or a new branch. list_known_agents shows saved folders;
+forget_agent removes one.
+
+Guardrails toggle: the user can say "guardrails off" or "guardrails on" at any
+time. The toggle is detected and enforced in code, not by you — never claim to
+have switched it yourself, and a bracketed note is injected into the
+conversation whenever the state changes. While guardrails are OFF, tell_agent
+and spawn_task deliver immediately with no read-back or confirmation; after
+delivering, briefly tell the user what was sent and to whom.
 
 For "what did the agent say/find/conclude", prefer agent_report (full replies
 from its transcript). Use read_pane for what is on screen now: pending prompts,
 errors, running commands.
 Resolve casual project names to workspace labels via fleet_status. If a reference
 is genuinely ambiguous, ask one short question instead of guessing.
-Before approving anything an agent is waiting on, read its pane and tell the user
-exactly what will run if it looks destructive."""
+Before approving anything an agent is waiting on, read its pane first. If the
+pending action looks destructive, send_answer stages the keys instead of
+sending: read the on-screen action to the user verbatim, ask whether to
+approve it, and call send_staged only after they reply. "Guardrails off" does
+not bypass this — destructive approvals always need the spoken yes."""
+
+
+# ---------------------------------------------------------------------------
+# speech + rail-toggle helpers (pure functions, unit tested)
+
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
+
+
+def tts_sanitize(text: str) -> str:
+    """Agent replies are markdown; kokoro speaks punctuation literally. Strip
+    code blocks, links, bullets, emphasis and non-ascii so the result reads
+    as plain sentences."""
+    text = re.sub(r"```.*?```", " ", text, flags=re.S)
+    text = re.sub(r"`([^`]*)`", r"\1", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"^[ \t]*(?:[-*+]|\d+[.)])[ \t]+", "", text, flags=re.M)
+    text = re.sub(r"^#{1,6}[ \t]+", "", text, flags=re.M)
+    text = re.sub(r"[*_#>|~]", "", text)
+    text = "".join(ch for ch in text
+                   if ch.isascii() and (ch.isprintable() or ch in "\n\t"))
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def tts_summary(text: str, max_sentences: int = 2, max_chars: int = 320) -> str:
+    """First sentence or two of a sanitized reply — the spoken heads-up when
+    an agent finishes. The full reply stays available via agent_report."""
+    clean = tts_sanitize(text)
+    if not clean:
+        return "It didn't say anything I can read out."
+    sentences: list[str] = []
+    for s in _SENTENCE_END.split(clean):
+        if sentences and (len(sentences) >= max_sentences
+                          or len(" ".join(sentences)) + len(s) > max_chars):
+            break
+        sentences.append(s)
+    summary = " ".join(sentences)[:max_chars].strip()
+    if summary[-1] not in ".!?":
+        summary += "."
+    return summary
+
+
+_RAIL_ON = ("guardrailson", "guardrailon")
+_RAIL_OFF = ("guardrailsoff", "guardrailoff")
+
+
+def detect_rail_toggle(transcript: str) -> bool | None:
+    """True = guardrails on, False = off, None = no toggle phrase. Matched on
+    the raw STT transcript with everything but letters removed, so "guard
+    rails off", "guardrails off" and "guard-rails, off" all count. If both
+    phrases appear, the last one spoken wins."""
+    squashed = re.sub(r"[^a-z]", "", transcript.lower())
+    on = max((squashed.rfind(p) for p in _RAIL_ON), default=-1)
+    off = max((squashed.rfind(p) for p in _RAIL_OFF), default=-1)
+    if on == off == -1:
+        return None
+    return on > off
+
+
+class Delegations:
+    """Panes handed work this call, with enough state to tell a real finish
+    from the delivery race: right after prompt_agent returns, herdr is still
+    typing the prompt into the pane, so the pane sits idle for a couple of
+    seconds — idle+delegated alone must NOT count as finished, or the watcher
+    announces a stale reply and permanently eats the real notification.
+
+    A pane is finish_ready once it has been seen working. If it is never seen
+    working within GRACE_SECS, that usually means herdr's delayed Enter got
+    swallowed by the agent's paste guard and the prompt is sitting typed but
+    unsubmitted — the watcher then sends a one-shot Enter nudge (needs_nudge/
+    mark_nudged). Only after the nudge plus a second grace window with still
+    no working state does idle count as finished (a task so quick that every
+    observation missed the working state)."""
+
+    GRACE_SECS = 20.0
+
+    def __init__(self, clock=time.monotonic):
+        self._clock = clock
+        self._panes: dict[str, dict] = {}
+
+    def add(self, pane_id: str) -> None:
+        self._panes[pane_id] = {"at": self._clock(), "started": False,
+                                "nudged": False}
+
+    def discard(self, pane_id: str) -> None:
+        self._panes.pop(pane_id, None)
+
+    def mark_started(self, pane_id: str) -> None:
+        entry = self._panes.get(pane_id)
+        if entry:
+            entry["started"] = True
+
+    def needs_nudge(self, pane_id: str) -> bool:
+        entry = self._panes.get(pane_id)
+        if entry is None:
+            return False
+        return (not entry["started"] and not entry["nudged"]
+                and self._clock() - entry["at"] >= self.GRACE_SECS)
+
+    def mark_nudged(self, pane_id: str) -> None:
+        entry = self._panes.get(pane_id)
+        if entry:
+            entry["nudged"] = True
+            entry["at"] = self._clock()  # fresh grace window after the nudge
+
+    def finish_ready(self, pane_id: str) -> bool:
+        entry = self._panes.get(pane_id)
+        if entry is None:
+            return False
+        if entry["started"]:
+            return True
+        return (entry["nudged"]
+                and self._clock() - entry["at"] >= self.GRACE_SECS)
+
+    def __contains__(self, pane_id: str) -> bool:
+        return pane_id in self._panes
+
+    def __iter__(self):
+        return iter(self._panes)
 
 
 def user_transcripts(ctx) -> list[str]:
@@ -121,18 +240,73 @@ def user_transcripts(ctx) -> list[str]:
 
 
 class Mate(Agent):
-    def __init__(self, herdr: HerdrClient):
+    def __init__(self, herdr: HerdrClient, known: KnownAgents | None = None,
+                 roots: list | None = None):
         super().__init__(instructions=INSTRUCTIONS)
         self.herdr = herdr
+        # name -> path memory of spawn targets the user has confirmed;
+        # roots override is for tests (default: MATEBRIDGE_SRC_ROOTS / ~/src)
+        self.known = known if known is not None else KnownAgents()
+        self._roots = roots
         self._read_panes: set[str] = set()  # rails: read before approve
         # panes given work this call; watch_fleet announces when they finish
-        self.delegated: set[str] = set()
+        self.delegated = Delegations()
+        # background task-delivery coroutines (a spawned claude can take
+        # minutes to boot; the call must not block on it). Strong refs so
+        # they aren't garbage-collected mid-flight.
+        self._bg: set[asyncio.Task] = set()
+        # stage-and-confirm rail master switch, voice-toggled via
+        # on_user_turn_completed ("guardrails on/off") — enforced in code,
+        # never trusted to the model
+        self.rail_enabled = True
         # stage-and-confirm rail: tell_agent/spawn_task park the exact
         # payload here; send_staged delivers it only after (a) at least one
         # new user turn since staging and (b) that turn's raw STT transcript
         # passes approves_send. The model never re-supplies the text, so what
         # was read back is byte-for-byte what gets delivered.
         self._staged: dict | None = None
+
+    async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
+        """Code-level intercept on every finalized user transcript: detect the
+        guardrail toggle phrase, flip the flag here (the model is never asked
+        to), and inject the state change into this message so the LLM knows
+        from this turn onward — the note persists in chat history."""
+        toggle = detect_rail_toggle(new_message.text_content or "")
+        if toggle is None:
+            return
+        already = toggle == self.rail_enabled
+        self.rail_enabled = toggle
+        state = ("ON: tell_agent and spawn_task stage only, and delivery "
+                 "requires a spoken confirmation via send_staged"
+                 if toggle else
+                 "OFF: tell_agent and spawn_task deliver immediately with no "
+                 "read-back or confirmation")
+        logger.info("guardrails voice toggle: now %s%s",
+                    "ON" if toggle else "OFF",
+                    " (was already)" if already else "")
+        new_message.content.append(
+            "[code intercept: guardrail toggle phrase heard. Guardrails are "
+            + ("already " if already else "now ") + state
+            + ". Briefly confirm this to the user.]")
+
+    async def _pane_label(self, pane_id: str) -> str:
+        """Speakable name for a pane — workspace label, else pane title, else
+        a generic fallback. Pane ids read as gibberish over TTS."""
+        try:
+            snap = await self.herdr.snapshot()
+        except HerdrError:
+            return "coding"
+        pane = next((p for p in snap.get("panes", [])
+                     if p.get("pane_id") == pane_id), None)
+        if pane:
+            ws = next((w for w in snap.get("workspaces", [])
+                       if w.get("workspace_id") == pane.get("workspace_id")),
+                      None)
+            if ws and ws.get("label"):
+                return str(ws["label"])
+            if pane.get("terminal_title_stripped"):
+                return str(pane["terminal_title_stripped"])
+        return "coding"
 
     @function_tool
     async def fleet_status(self, ctx: RunContext):
@@ -165,26 +339,29 @@ class Mate(Agent):
 
     @function_tool
     async def send_answer(self, ctx: RunContext, pane_id: str, keys: list[str]):
-        """Answer a blocked agent's on-screen prompt with keys, e.g. ["1","Enter"]."""
+        """Answer a blocked agent's on-screen prompt with keys, e.g.
+        ["1","Enter"]. If the pending action looks destructive nothing is
+        sent: the keys are staged — read the on-screen action to the user
+        verbatim, ask whether to approve it, and call send_staged after they
+        reply."""
         if pane_id not in self._read_panes:
             return ("REFUSED: read the pane first so the user knows what "
                     "they are approving.")
         try:
             text = await self.herdr.read_pane(pane_id, 40)
             if is_destructive(text):
-                return ("REFUSED: the pending action looks destructive. Read it to "
-                        "the user verbatim and get explicit confirmation, then call "
-                        "send_answer_confirmed.")
-            await self.herdr.send_keys(pane_id, keys)
-        except HerdrError as e:
-            return f"ERROR: {e.code}: {e.message} (pane {pane_id})"
-        return "sent"
-
-    @function_tool
-    async def send_answer_confirmed(self, ctx: RunContext, pane_id: str,
-                                    keys: list[str]):
-        """Send keys after the user explicitly confirmed a destructive action read to them verbatim."""
-        try:
+                # destructive approvals ALWAYS take the rail — rail_enabled
+                # (the "guardrails off" convenience toggle) covers messaging
+                # and spawns, never this
+                self._staged = {"kind": "keys", "pane_id": pane_id,
+                                "keys": keys,
+                                "turns": len(user_transcripts(ctx))}
+                return (f"NOT SENT: the pending action looks destructive, so "
+                        f"the keys {keys} are staged for pane {pane_id}. Read "
+                        "the pending on-screen action to the user verbatim, "
+                        "ask whether to approve it, and stop. Call "
+                        "send_staged only after they reply; if they decline, "
+                        "call discard_staged.")
             await self.herdr.send_keys(pane_id, keys)
         except HerdrError as e:
             return f"ERROR: {e.code}: {e.message} (pane {pane_id})"
@@ -242,7 +419,15 @@ class Mate(Agent):
             if agent is None:
                 return f"ERROR: no coding agent is registered in pane {pane_id}."
             status = agent.get("agent_status", "unknown")
+            if status == "working":
+                self.delegated.mark_started(pane_id)
             if status in ("idle", "done", "blocked"):
+                if (pane_id in self.delegated
+                        and not self.delegated.finish_ready(pane_id)):
+                    # just delivered: herdr is still typing the prompt, so
+                    # "idle" here is the pre-start state, not a finish
+                    await asyncio.sleep(1.0)
+                    continue
                 self.delegated.discard(pane_id)
                 reply = await self._agent_replies(pane_id)
                 return f"agent finished (status: {status}). Its reply:\n{reply}"
@@ -251,11 +436,143 @@ class Mate(Agent):
                 "notified automatically the moment it finishes. Tell them "
                 "that and move on.")
 
+    async def _speak_confirmation(self, text: str) -> bool:
+        """Speak a code-composed confirmation via TTS, bypassing the LLM —
+        what is spoken is byte-for-byte what was staged. Returns False when
+        no live session is attached (unit tests, console edge cases); the
+        caller then falls back to a read-this-exactly tool result."""
+        try:
+            session = self.session
+        except Exception:  # noqa: BLE001 - not attached yet
+            return False
+        if session is None:
+            return False
+        await session.say(text)
+        return True
+
+    def _deliver_task_in_background(self, pane_id: str | None, task: str,
+                                    label: str) -> None:
+        """Hand the first prompt to a freshly spawned agent without blocking
+        the call: claude can take minutes to boot (herdr answers
+        agent_not_ready the whole time), and killing or stalling on that
+        would be wrong — the songhaus bug. The pane joins `delegated` only
+        once the task actually lands, so the watcher's grace/nudge clock
+        starts at delivery, not at spawn. An empty task means the user asked
+        for an agent with nothing to do yet — herdr rejects empty prompts
+        (empty_agent_prompt), so there is nothing to deliver."""
+        if not pane_id or not task.strip():
+            return
+        t = asyncio.create_task(self._deliver_task_bg(pane_id, task, label))
+        self._bg.add(t)
+        t.add_done_callback(self._bg.discard)
+
+    async def _deliver_task_bg(self, pane_id: str, task: str,
+                               label: str) -> None:
+        try:
+            await self.herdr.deliver_task(pane_id, task)
+        except Exception:
+            logger.exception("background task delivery to %s (%s) failed",
+                             pane_id, label)
+            await self._speak_confirmation(
+                f"Hey mate, the {label} agent came up but never took the "
+                "task. The workspace is still open if you want a look.")
+            return
+        logger.info("background task delivery to %s (%s) succeeded",
+                    pane_id, label)
+        self.delegated.add(pane_id)
+
+    async def _nudge_after_tell(self, pane_id: str) -> None:
+        try:
+            await self.herdr.nudge_enter(pane_id)
+        except Exception:  # noqa: BLE001 - best-effort, never user-visible
+            logger.exception("post-tell enter nudge failed for %s", pane_id)
+
+    async def _deliver(self, staged: dict) -> str:
+        """Actually deliver a staged payload (shared by send_staged and the
+        guardrails-off immediate path)."""
+        if staged["kind"] == "spawn_folder":
+            try:
+                result = await self.herdr.spawn_in_folder(
+                    staged["path"], staged["name"],
+                    agent=staged.get("agent", "claude"))
+            except HerdrError as e:
+                return f"ERROR: {e.code}: {e.message}"
+            # the user just said yes to this exact path (or has guardrails
+            # off): remember it so next time gets the short confirmation
+            self.known.remember(staged["name"], staged["path"])
+            self._deliver_task_in_background(
+                result.get("pane_id"), staged["task"], staged["name"])
+            result["task_delivery"] = (
+                "queued — the task is handed over automatically as soon as "
+                "the agent finishes booting; the user does not need to wait"
+                if staged["task"].strip() else
+                "none — no task was given; the agent opens ready and waits "
+                "for instructions")
+            return json.dumps(result)
+        if staged["kind"] == "spawn":
+            try:
+                result = await self.herdr.spawn(
+                    staged["repo_path"], staged["branch"])
+            except HerdrError as e:
+                return f"ERROR: {e.code}: {e.message}"
+            self._deliver_task_in_background(
+                result.get("pane_id"), staged["task"], staged["branch"])
+            return json.dumps(result)
+        if staged["kind"] == "keys":
+            try:
+                await self.herdr.send_keys(staged["pane_id"], staged["keys"])
+            except HerdrError as e:
+                return (f"ERROR: {e.code}: {e.message} "
+                        f"(pane {staged['pane_id']})")
+            return "sent"
+        pane_id = staged["pane_id"]
+        try:
+            await self.herdr.prompt_agent(pane_id, staged["text"])
+        except HerdrError as e:
+            if e.code == "agent_not_ready":
+                # the agent is still booting (herdr refuses prompts until it
+                # detects it idle — can take minutes on a first launch).
+                # Queue the message instead of bouncing it back to the user.
+                label = await self._pane_label(pane_id)
+                self._deliver_task_in_background(
+                    pane_id, staged["text"], label)
+                return (f"the {label} agent is still starting up — the "
+                        "message is queued and will be handed over the "
+                        "moment it is ready. Tell the user that; nothing "
+                        "more to do.")
+            if e.code == "agent_not_found":
+                return (f"ERROR: no coding agent is registered in pane {pane_id} — "
+                        "it is just a shell. An agent appears only once claude (or "
+                        "another integrated agent) is launched inside a herdr pane. "
+                        "Tell the user that pane has no agent to talk to.")
+            return f"ERROR: {e.code}: {e.message} (pane {pane_id})"
+        # paste-guard self-heal: herdr accepted the prompt, but Claude Code
+        # sometimes eats the delayed Enter (seen live: message stuck in the
+        # input box, invisible to the watcher when the pane was already
+        # working). A trailing Enter is a no-op when delivery worked.
+        t = asyncio.create_task(self._nudge_after_tell(pane_id))
+        self._bg.add(t)
+        t.add_done_callback(self._bg.discard)
+        self.delegated.add(pane_id)
+        return ("delivered. For a quick question, call wait_for_agent once. "
+                "For anything longer, tell the user they'll be notified when "
+                "it finishes — do not check again on your own.")
+
     @function_tool
     async def tell_agent(self, ctx: RunContext, pane_id: str, text: str):
-        """Stage a natural-language instruction for a coding agent. Nothing is
-        sent yet: read the staged text back to the user word for word, ask
-        whether to send it, and call send_staged after they reply."""
+        """Stage a natural-language instruction for a coding agent. With
+        guardrails on (default) nothing is sent yet: read the staged text back
+        to the user word for word, ask whether to send it, and call
+        send_staged after they reply. With guardrails off it is delivered
+        immediately."""
+        if not self.rail_enabled:
+            self._staged = None
+            result = await self._deliver(
+                {"kind": "tell", "pane_id": pane_id, "text": text})
+            if result.startswith("ERROR"):
+                return result
+            return (f'guardrails off — delivered to pane {pane_id} '
+                    f'immediately: "{text}"\n' + result)
         self._staged = {"kind": "tell", "pane_id": pane_id, "text": text,
                         "turns": len(user_transcripts(ctx))}
         return (f'staged for pane {pane_id}: "{text}"\n'
@@ -266,9 +583,18 @@ class Mate(Agent):
     @function_tool
     async def spawn_task(self, ctx: RunContext, repo_path: str, branch: str,
                          task: str):
-        """Stage a new worktree + coding agent on a task. Nothing is created
-        yet: read the staged task back to the user word for word, ask whether
-        to go ahead, and call send_staged after they reply."""
+        """Stage a new worktree + coding agent on a task. With guardrails on
+        (default) nothing is created yet: read the staged task back to the
+        user word for word, ask whether to go ahead, and call send_staged
+        after they reply. With guardrails off it starts immediately."""
+        if not self.rail_enabled:
+            self._staged = None
+            result = await self._deliver(
+                {"kind": "spawn", "repo_path": repo_path, "branch": branch,
+                 "task": task})
+            if result.startswith("ERROR"):
+                return result
+            return ("guardrails off — task started immediately.\n" + result)
         self._staged = {"kind": "spawn", "repo_path": repo_path,
                         "branch": branch, "task": task,
                         "turns": len(user_transcripts(ctx))}
@@ -277,6 +603,89 @@ class Mate(Agent):
                 "NOT STARTED YET. Read that back to the user word for word, "
                 "ask whether to go ahead, and stop. Call send_staged only "
                 "after they reply.")
+
+    @function_tool
+    async def spawn_in_folder(self, ctx: RunContext, folder_name: str,
+                              task: str, agent: str = "claude"):
+        """Spawn a new coding agent directly in an existing source folder (it
+        edits the real checkout — use spawn_task only if the user explicitly
+        asks for a worktree or branch). Pass the user's SPOKEN folder name;
+        the path is resolved and confirmed in code. Leave agent as "claude"
+        unless the user names a different harness. If the user gave no task,
+        pass task as an empty string — the agent opens ready and waits; do
+        not invent a task. After calling this, do not read anything back —
+        wait for the user's answer, then call send_staged (yes) or
+        discard_staged (no)."""
+        agent = agent.strip().lower() or "claude"
+        # spoken confirmations name the harness only when it isn't the default
+        agent_phrase = "a new agent" if agent == "claude" else f"a {agent} agent"
+        known_path = self.known.get(folder_name)
+        stale = known_path is not None and not os.path.isdir(known_path)
+        if known_path and not stale:
+            # tier 2: previously confirmed target -> short confirmation
+            name, path = folder_name, known_path
+            confirmation = (f"Spawning in {name} — go ahead?"
+                            if agent == "claude" else
+                            f"Spawning {agent_phrase} in {name} — go ahead?")
+        else:
+            candidates = resolve_folder(folder_name, self._roots)
+            if not candidates:
+                return (f'ERROR: no folder matching "{folder_name}" under '
+                        "the source roots. Ask the user for the folder name "
+                        "again.")
+            if len(candidates) > 1:
+                options = ", ".join(c.name for c in candidates)
+                return (f'AMBIGUOUS: several folders match "{folder_name}": '
+                        f"{options}. Ask the user which one they mean.")
+            path = str(candidates[0])
+            name = candidates[0].name
+            # tier 1: unknown target -> full path, stated from the exact
+            # bytes that will be used
+            task_phrase = (f"task: {task}" if task.strip()
+                           else "no task yet, it will open ready and wait")
+            confirmation = (
+                f"About to spawn {agent_phrase} in {name} — full path "
+                f"{speakable_path(path)} — {task_phrase}. Should I go ahead?")
+            if stale:
+                confirmation = (f"Heads up: the remembered folder for {name} "
+                                "no longer exists, so I re-resolved it. "
+                                + confirmation)
+        if not self.rail_enabled:
+            self._staged = None
+            result = await self._deliver(
+                {"kind": "spawn_folder", "path": path, "name": name,
+                 "task": task, "agent": agent})
+            if result.startswith("ERROR"):
+                return result
+            return (f"guardrails off — agent started immediately in {path}.\n"
+                    + result)
+        self._staged = {"kind": "spawn_folder", "path": path, "name": name,
+                        "task": task, "agent": agent,
+                        "turns": len(user_transcripts(ctx))}
+        if await self._speak_confirmation(confirmation):
+            return ("staged; the confirmation question was already SPOKEN to "
+                    "the user by code. Do not repeat it or read anything "
+                    "back — reply with nothing. When the user answers, call "
+                    "send_staged (yes) or discard_staged (no).")
+        return ('staged. Read this to the user EXACTLY, then stop: "'
+                + confirmation + '"')
+
+    @function_tool
+    async def list_known_agents(self, ctx: RunContext):
+        """Saved spawn targets (name and folder) the user has previously
+        confirmed. Use when the user asks what agents/folders are known."""
+        pairs = self.known.names()
+        if not pairs:
+            return "no known agents saved yet."
+        return json.dumps([{"name": n, "path": p} for n, p in pairs])
+
+    @function_tool
+    async def forget_agent(self, ctx: RunContext, name: str):
+        """Remove a saved spawn target from memory, so its next spawn needs
+        the full path confirmation again."""
+        if self.known.forget(name):
+            return f"forgotten: {name}. Its next spawn needs full confirmation."
+        return f'ERROR: no known agent matching "{name}".'
 
     @function_tool
     async def send_staged(self, ctx: RunContext):
@@ -298,29 +707,7 @@ class Mate(Agent):
                     "send_staged again. If they do not want it sent, call "
                     "discard_staged.")
         self._staged = None  # one delivery attempt per confirmation
-        if staged["kind"] == "spawn":
-            try:
-                result = await self.herdr.spawn(
-                    staged["repo_path"], staged["branch"], staged["task"])
-            except HerdrError as e:
-                return f"ERROR: {e.code}: {e.message}"
-            if result.get("pane_id"):
-                self.delegated.add(result["pane_id"])
-            return json.dumps(result)
-        pane_id = staged["pane_id"]
-        try:
-            await self.herdr.prompt_agent(pane_id, staged["text"])
-        except HerdrError as e:
-            if e.code == "agent_not_found":
-                return (f"ERROR: no coding agent is registered in pane {pane_id} — "
-                        "it is just a shell. An agent appears only once claude (or "
-                        "another integrated agent) is launched inside a herdr pane. "
-                        "Tell the user that pane has no agent to talk to.")
-            return f"ERROR: {e.code}: {e.message} (pane {pane_id})"
-        self.delegated.add(pane_id)
-        return ("delivered. For a quick question, call wait_for_agent once. "
-                "For anything longer, tell the user they'll be notified when "
-                "it finishes — do not check again on your own.")
+        return await self._deliver(staged)
 
     @function_tool
     async def discard_staged(self, ctx: RunContext):
@@ -414,48 +801,84 @@ async def entrypoint(ctx: JobContext):
         # resubscribe every WATCH_RESUBSCRIBE_SECS to pick up new panes.
         # The snapshot doubles as a catch-up pass for delegated panes that
         # finished while we weren't subscribed.
+        async def say(text):
+            # session.say = deterministic TTS, no LLM in the loop. qwen has
+            # twice mangled generate_reply(instructions=...) at exactly this
+            # moment (once refusing to call a tool, once repeating its
+            # previous sentence verbatim instead of announcing), and the
+            # notification moment is too important to gamble on it.
+            # add_to_chat_ctx defaults True, so the model still knows what
+            # was said.
+            logger.info("watch_fleet: announcing: %s", text)
+            await session.say(text)
+            logger.info("watch_fleet: announcement spoken")
+
         async def announce(status, pane_id, data):
+            if status == "working":
+                if pane_id in mate.delegated:
+                    mate.delegated.mark_started(pane_id)
+                    logger.info("watch_fleet: delegated pane %s started "
+                                "working", pane_id)
+                return
             if status == "blocked":
-                await session.generate_reply(
-                    instructions="Briefly tell the user this agent just got "
-                                 "blocked and offer to read its question: "
-                                 + json.dumps(data))
+                label = await mate._pane_label(pane_id)
+                await say(f"Hey mate, the {label} agent is waiting on your "
+                          "approval. Want me to read its question?")
             elif (status in ("idle", "done")
                   and pane_id in mate.delegated):
+                if not mate.delegated.finish_ready(pane_id):
+                    # delivery race: the pane was never seen working after
+                    # delivery. Early on, herdr is still typing the prompt;
+                    # announcing now would read a STALE reply and discard the
+                    # pane, eating the real notification later.
+                    if mate.delegated.needs_nudge(pane_id):
+                        # grace expired with no working state: herdr's delayed
+                        # Enter was probably swallowed by the agent's paste
+                        # guard, leaving the prompt typed but unsubmitted.
+                        # One bare Enter submits it (and is a no-op on an
+                        # empty input box if it did go through).
+                        logger.warning("watch_fleet: pane %s never started "
+                                       "after delivery — nudging with Enter "
+                                       "(submit likely lost)", pane_id)
+                        try:
+                            await herdr.send_keys(pane_id, ["Enter"])
+                        except HerdrError as e:
+                            logger.warning("watch_fleet: nudge failed: %s", e)
+                        mate.delegated.mark_nudged(pane_id)
+                    else:
+                        logger.info("watch_fleet: pane %s idle but not "
+                                    "finish-ready yet, skipping", pane_id)
+                    return
                 mate.delegated.discard(pane_id)  # one announcement per task
-                # Fetch the reply here and hand it over inline: asking qwen
-                # to call agent_report from an injected instruction doesn't
-                # work reliably (live test: it repeated its previous sentence
-                # instead of calling the tool).
+                # Fetch the reply here: asking qwen to call agent_report from
+                # an injected instruction doesn't work reliably.
                 reply = await mate._agent_replies(pane_id)
+                label = await mate._pane_label(pane_id)
                 if reply.startswith("ERROR"):
-                    await session.generate_reply(
-                        instructions="The agent you delegated work to on "
-                                     f"pane {pane_id} just finished, but its "
-                                     "reply could not be read. Tell the user "
-                                     "it finished and offer to read its pane.")
+                    logger.warning("watch_fleet: finish on %s but reply "
+                                   "unreadable: %s", pane_id, reply)
+                    await say(f"Hey mate, the {label} agent just finished, "
+                              "but I couldn't read its reply. Want me to "
+                              "read its screen instead?")
                 else:
-                    await session.generate_reply(
-                        instructions="The agent you delegated work to just "
-                                     "finished. Its reply was:\n"
-                                     + reply[-1500:]
-                                     + "\nTell the user it finished and "
-                                     "summarize the reply in one or two "
-                                     "spoken sentences. Do not repeat "
-                                     "anything you already said.")
+                    await say(f"Hey mate, the {label} agent just finished. "
+                              f"{tts_summary(reply)} Want the full report?")
 
         while True:
             try:
                 snap = await herdr.snapshot()
-                # catch-up: delegated panes that finished between
+                # catch-up: delegated panes that changed state between
                 # subscriptions (idle/done only -- re-announcing "blocked"
-                # every cycle would nag)
+                # every cycle would nag; "working" just marks started)
                 for a in snap.get("agents", []):
                     if (a.get("pane_id") in mate.delegated
-                            and a.get("agent_status") in ("idle", "done")):
+                            and a.get("agent_status")
+                            in ("idle", "done", "working")):
                         await announce(a["agent_status"], a["pane_id"], a)
                 pane_ids = [p["pane_id"] for p in snap.get("panes", [])
                             if p.get("pane_id")]
+                logger.info("watch_fleet: cycle: %d panes, delegated=%s",
+                            len(pane_ids), list(mate.delegated))
                 if not pane_ids:
                     await asyncio.sleep(WATCH_RESUBSCRIBE_SECS)
                     continue
@@ -475,6 +898,9 @@ async def entrypoint(ctx: JobContext):
                         except (StopAsyncIteration, asyncio.TimeoutError):
                             break
                         data = msg.get("data", {})
+                        logger.info("watch_fleet: event pane=%s status=%s",
+                                    data.get("pane_id"),
+                                    data.get("agent_status"))
                         await announce(data.get("agent_status"),
                                        data.get("pane_id"), data)
                 finally:
@@ -494,9 +920,14 @@ async def entrypoint(ctx: JobContext):
     ctx.add_shutdown_callback(_stop_watcher)
 
     await session.start(agent=mate, room=ctx.room)
-    await session.generate_reply(
-        instructions="Greet briefly: say you're here and how many agents "
-                     "are running.")
+    # deterministic greeting -- no LLM roll on the very first thing heard
+    try:
+        snap = await herdr.snapshot()
+        n = len(snap.get("agents", []))
+        fleet = f"{n} agent{'s' if n != 1 else ''} running"
+    except Exception:  # noqa: BLE001 - greet anyway, tools will surface it
+        fleet = "your fleet is up"
+    await session.say(f"G'day mate. {fleet}. What do you need?")
 
 
 if __name__ == "__main__":

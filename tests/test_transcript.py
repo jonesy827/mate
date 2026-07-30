@@ -4,8 +4,9 @@ import json
 
 import pytest
 
-import matebridge.agent as agent_mod
-from matebridge.agent import Mate, claude_transcript_path, read_transcript_replies
+import matebridge.transcripts as transcripts_mod
+from matebridge.agent import Mate
+from matebridge.transcripts import claude_transcript_path, read_transcript_replies
 
 pytestmark = pytest.mark.asyncio
 
@@ -57,7 +58,7 @@ def test_read_transcript_replies_skips_junk(tmp_path):
 
 
 async def test_agent_report_returns_last_reply(tmp_path, monkeypatch):
-    monkeypatch.setattr(agent_mod, "CLAUDE_PROJECTS", tmp_path)
+    monkeypatch.setattr(transcripts_mod, "CLAUDE_PROJECTS", tmp_path)
     write_transcript(tmp_path, ["the project is japan-translate"])
     mate = Mate(SnapshotHerdr([claude_agent()]))
     out = await mate.agent_report(None, pane_id="w1:p1")
@@ -65,7 +66,7 @@ async def test_agent_report_returns_last_reply(tmp_path, monkeypatch):
 
 
 async def test_agent_report_no_agent(tmp_path, monkeypatch):
-    monkeypatch.setattr(agent_mod, "CLAUDE_PROJECTS", tmp_path)
+    monkeypatch.setattr(transcripts_mod, "CLAUDE_PROJECTS", tmp_path)
     mate = Mate(SnapshotHerdr([]))
     out = await mate.agent_report(None, pane_id="w1:p1")
     assert out.startswith("ERROR")
@@ -73,7 +74,7 @@ async def test_agent_report_no_agent(tmp_path, monkeypatch):
 
 
 async def test_agent_report_missing_file(tmp_path, monkeypatch):
-    monkeypatch.setattr(agent_mod, "CLAUDE_PROJECTS", tmp_path)
+    monkeypatch.setattr(transcripts_mod, "CLAUDE_PROJECTS", tmp_path)
     mate = Mate(SnapshotHerdr([claude_agent()]))
     out = await mate.agent_report(None, pane_id="w1:p1")
     assert out.startswith("ERROR")
@@ -95,7 +96,7 @@ class StatusHerdr(SnapshotHerdr):
 
 
 async def test_wait_for_agent_returns_reply_when_idle(tmp_path, monkeypatch):
-    monkeypatch.setattr(agent_mod, "CLAUDE_PROJECTS", tmp_path)
+    monkeypatch.setattr(transcripts_mod, "CLAUDE_PROJECTS", tmp_path)
     write_transcript(tmp_path, ["all done boss"])
     mate = Mate(StatusHerdr(["working", "idle"]))
     mate.delegated.add("w1:p1")
@@ -105,7 +106,7 @@ async def test_wait_for_agent_returns_reply_when_idle(tmp_path, monkeypatch):
 
 
 async def test_wait_for_agent_times_out_without_looping(tmp_path, monkeypatch):
-    monkeypatch.setattr(agent_mod, "CLAUDE_PROJECTS", tmp_path)
+    monkeypatch.setattr(transcripts_mod, "CLAUDE_PROJECTS", tmp_path)
     mate = Mate(StatusHerdr(["working"]))
     out = await mate.wait_for_agent(None, pane_id="w1:p1", seconds=1)
     assert "STOP checking" in out

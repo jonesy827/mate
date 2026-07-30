@@ -1,6 +1,7 @@
 """Stage-and-confirm rail: tell_agent/spawn_task stage, send_staged delivers
 only after a new user turn whose raw transcript passes approves_send."""
 
+import asyncio
 import json
 
 import pytest
@@ -29,15 +30,23 @@ class FakeCtx:
 class RecordingHerdr:
     def __init__(self):
         self.prompts: list[tuple[str, str]] = []
-        self.spawns: list[tuple[str, str, str]] = []
+        self.spawns: list[tuple[str, str]] = []
+        self.deliveries: list[tuple[str, str]] = []
 
     async def prompt_agent(self, target, text):
         self.prompts.append((target, text))
         return {}
 
-    async def spawn(self, repo_path, branch, task):
-        self.spawns.append((repo_path, branch, task))
-        return {"pane_id": "w9:p1", "workspace_id": "w9"}
+    async def spawn(self, repo_path, branch):
+        self.spawns.append((repo_path, branch))
+        return {"pane_id": "w9:p1", "workspace_id": "w9",
+                "agent_name": branch}
+
+    async def deliver_task(self, pane_id, task):
+        self.deliveries.append((pane_id, task))
+
+    async def nudge_enter(self, pane_id):
+        pass
 
 
 async def test_tell_agent_stages_without_sending():
@@ -144,8 +153,34 @@ async def test_spawn_task_rail_parallels_tell_agent():
     assert blocked.startswith("NOT SENT")
     sent = await mate.send_staged(FakeCtx(["first", "wait", "go ahead"]))
     assert json.loads(sent)["pane_id"] == "w9:p1"
-    assert herdr.spawns == [("/repo", "main", "fix the tests")]
+    assert herdr.spawns == [("/repo", "main")]
+    while mate._bg:
+        await asyncio.gather(*list(mate._bg))
+    assert herdr.deliveries == [("w9:p1", "fix the tests")]
     assert "w9:p1" in mate.delegated
+
+
+async def test_tell_agent_queues_message_while_agent_boots():
+    # a just-spawned agent answers agent_not_ready for its whole boot (over
+    # a minute in a big folder) — tell_agent must queue the message for
+    # background delivery, not bounce "isn't ready" back at the user
+    class BootingHerdr(RecordingHerdr):
+        async def prompt_agent(self, target, text):
+            raise HerdrError("agent.prompt", "agent_not_ready", "pending")
+
+        async def snapshot(self):
+            return {"panes": [], "workspaces": []}
+
+    herdr = BootingHerdr()
+    mate = Mate(herdr)
+    mate.rail_enabled = False
+    out = await mate.tell_agent(None, pane_id="wA:p1", text="start the task")
+    assert "queued" in out and "still starting up" in out
+    assert "wA:p1" not in mate.delegated
+    while mate._bg:
+        await asyncio.gather(*list(mate._bg))
+    assert herdr.deliveries == [("wA:p1", "start the task")]
+    assert "wA:p1" in mate.delegated
 
 
 async def test_agent_not_found_surfaces_from_send_staged():
