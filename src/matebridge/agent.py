@@ -391,11 +391,16 @@ async def entrypoint(ctx: JobContext):
         tts=openai.TTS(base_url=TTS_URL, api_key="local", model="tts-1",
                        voice=TTS_VOICE),
         turn_handling={
-            # Batch whisper takes ~4-5s to return a transcript, so the default
-            # 2s false-interruption window always expires first: Mate resumes
-            # speaking, then cuts off again when the transcript lands. Give
-            # STT time to confirm the interruption was real.
-            "interruption": {"false_interruption_timeout": 6.0},
+            # 3s (down from 6s, which was sized for 4-5s CPU whisper): GPU
+            # whisper returns in ~0.2s + ~0.8s transcript_delay, so 3s still
+            # comfortably covers a real interruption being confirmed while
+            # cutting the awkward resume-then-stop window in half.
+            "interruption": {"false_interruption_timeout": 3.0},
+            # A mid-sentence "um" pause let VAD commit the turn before the
+            # rest of the utterance's transcript arrived (livekit warned:
+            # "transcript arrives after turn has been committed, consider
+            # raising min_delay"), splitting one request into two turns.
+            "endpointing": {"min_delay": 1.0},
         },
     )
 
@@ -418,11 +423,26 @@ async def entrypoint(ctx: JobContext):
             elif (status in ("idle", "done")
                   and pane_id in mate.delegated):
                 mate.delegated.discard(pane_id)  # one announcement per task
-                await session.generate_reply(
-                    instructions="The agent you delegated work to just "
-                                 "finished. Use agent_report on pane "
-                                 f"{pane_id}, then give the user a one- or "
-                                 "two-sentence summary of what it did.")
+                # Fetch the reply here and hand it over inline: asking qwen
+                # to call agent_report from an injected instruction doesn't
+                # work reliably (live test: it repeated its previous sentence
+                # instead of calling the tool).
+                reply = await mate._agent_replies(pane_id)
+                if reply.startswith("ERROR"):
+                    await session.generate_reply(
+                        instructions="The agent you delegated work to on "
+                                     f"pane {pane_id} just finished, but its "
+                                     "reply could not be read. Tell the user "
+                                     "it finished and offer to read its pane.")
+                else:
+                    await session.generate_reply(
+                        instructions="The agent you delegated work to just "
+                                     "finished. Its reply was:\n"
+                                     + reply[-1500:]
+                                     + "\nTell the user it finished and "
+                                     "summarize the reply in one or two "
+                                     "spoken sentences. Do not repeat "
+                                     "anything you already said.")
 
         while True:
             try:
