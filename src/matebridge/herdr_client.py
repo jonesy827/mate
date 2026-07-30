@@ -7,7 +7,8 @@ Ground-truth protocol rules (verified; see matebridge-groundtruth/REPORT.md):
 - ONE request per connection: the server sends one response line, then
   closes. Pipelining or reusing a connection gets ECONNRESET/EPIPE.
 - events.subscribe is the exception: that connection stays open and streams
-  frames shaped {"event": "tab_created", "data": {...}} (no "id").
+  frames shaped {"event": "pane.agent_status_changed", "data": {...}}
+  (no "id"; event names are dotted, same as the subscription types).
 - "id" must be a string; "id", "method" and "params" are all required.
 - Unknown methods produce NO reply (the connection just closes).
 - Errors: {"id": ..., "error": {"code": "...", "message": "..."}}.
@@ -67,18 +68,28 @@ class HerdrClient:
             raise HerdrError(method, err.get("code", "?"), err.get("message", ""))
         return msg.get("result", {})
 
-    async def events(self, types: Iterable[str]) -> AsyncIterator[dict]:
+    async def events(
+            self, subscriptions: Iterable[dict | str]) -> AsyncIterator[dict]:
         """Subscribe and yield event frames {"event": ..., "data": ...} forever.
 
-        Subscription types use dots ("pane.agent_status_changed"); the frames
-        that come back use underscores ("pane_agent_status_changed").
+        Each subscription is a dict passed through verbatim, e.g.
+        {"type": "pane.agent_status_changed", "pane_id": "w2:p1"}; a bare
+        string t becomes {"type": t}. Pane-scoped types
+        (pane.agent_status_changed, pane.scroll_changed, pane.output_matched)
+        REQUIRE a pane_id — the server rejects a bare {"type": ...} with
+        invalid_request. Event frames use the same dotted names as the
+        subscription types, with a flat data payload (verified live:
+        {"event": "pane.agent_status_changed", "data": {"pane_id": ...,
+        "agent_status": ..., ...}}).
         """
         reader, writer = await asyncio.open_unix_connection(self.sock_path)
         try:
             writer.write(json.dumps({
                 "id": f"mb-ev-{next(self._ids)}",
                 "method": "events.subscribe",
-                "params": {"subscriptions": [{"type": t} for t in types]},
+                "params": {"subscriptions": [
+                    {"type": s} if isinstance(s, str) else s
+                    for s in subscriptions]},
             }).encode() + b"\n")
             await writer.drain()
             ack = json.loads(await asyncio.wait_for(

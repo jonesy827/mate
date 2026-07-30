@@ -42,14 +42,29 @@ class FakeHerdr:
         rid = req["id"]
 
         if method == "events.subscribe":
+            # Real server: pane-scoped subscription types REQUIRE pane_id;
+            # a bare {"type": "pane.agent_status_changed"} is rejected.
+            pane_scoped = ("pane.agent_status_changed", "pane.scroll_changed",
+                           "pane.output_matched")
+            for sub in req["params"]["subscriptions"]:
+                if sub["type"] in pane_scoped and "pane_id" not in sub:
+                    writer.write(json.dumps({"id": "", "error": {
+                        "code": "invalid_request",
+                        "message": "invalid request: missing field `pane_id`",
+                    }}).encode() + b"\n")
+                    await writer.drain()
+                    writer.close()
+                    return
             writer.write(json.dumps(
                 {"id": rid, "result": {"type": "subscription_started"}},
             ).encode() + b"\n")
             await writer.drain()
             for i in range(3):
+                # frames use dotted names + flat data, like the real server
                 writer.write(json.dumps({
-                    "event": "pane_agent_status_changed",
-                    "data": {"pane_id": f"w1:p{i}", "agent_status": "blocked"},
+                    "event": "pane.agent_status_changed",
+                    "data": {"pane_id": f"w1:p{i}", "agent_status": "blocked",
+                             "workspace_id": "w1"},
                 }).encode() + b"\n")
                 await writer.drain()
             writer.close()
@@ -143,14 +158,38 @@ async def test_snapshot_unwraps(fake):
 async def test_events_stream(fake):
     c = HerdrClient(fake.path)
     got = []
-    async for msg in c.events(["pane.agent_status_changed"]):
+    async for msg in c.events(
+            [{"type": "pane.agent_status_changed", "pane_id": "w1:p1"}]):
         got.append(msg)
     assert len(got) == 3
-    assert got[0]["event"] == "pane_agent_status_changed"
+    assert got[0]["event"] == "pane.agent_status_changed"
     assert got[0]["data"]["agent_status"] == "blocked"
     sub = fake.requests[0]
-    assert sub["params"] == {
-        "subscriptions": [{"type": "pane.agent_status_changed"}]}
+    assert sub["params"] == {"subscriptions": [
+        {"type": "pane.agent_status_changed", "pane_id": "w1:p1"}]}
+
+
+async def test_events_dict_subscriptions_pass_through(fake):
+    # dicts go on the wire verbatim; bare strings become {"type": t}
+    c = HerdrClient(fake.path)
+    async for _ in c.events([
+            {"type": "pane.agent_status_changed", "pane_id": "w2:p1"},
+            {"type": "pane.agent_status_changed", "pane_id": "w2:p2"},
+            "workspace.created"]):
+        break
+    assert fake.requests[0]["params"]["subscriptions"] == [
+        {"type": "pane.agent_status_changed", "pane_id": "w2:p1"},
+        {"type": "pane.agent_status_changed", "pane_id": "w2:p2"},
+        {"type": "workspace.created"}]
+
+
+async def test_events_pane_scoped_without_pane_id_rejected(fake):
+    # the exact bug that silently killed watch_fleet: fleet-wide subscribe
+    c = HerdrClient(fake.path)
+    with pytest.raises(HerdrError) as ei:
+        async for _ in c.events(["pane.agent_status_changed"]):
+            pass
+    assert ei.value.code == "invalid_request"
 
 
 async def test_find_pane_id():

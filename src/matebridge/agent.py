@@ -42,6 +42,12 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "qwen3.6-35b-a3b-long")
 STT_MODEL = os.environ.get("STT_MODEL", "Systran/faster-whisper-medium")
 TTS_VOICE = os.environ.get("TTS_VOICE", "af_heart")
 
+# pane.agent_status_changed subscriptions are per-pane, so the fleet watcher
+# resubscribes on this interval to pick up panes created since (spawn_task
+# and friends). Also bounds the catch-up latency for events missed while
+# between subscriptions.
+WATCH_RESUBSCRIBE_SECS = 30.0
+
 # Claude Code writes one JSONL transcript per session under
 # ~/.claude/projects/<munged-cwd>/<session-id>.jsonl. herdr's integration hook
 # reports the session id + cwd, which is enough to find it.
@@ -306,14 +312,16 @@ async def entrypoint(ctx: JobContext):
     )
 
     async def watch_fleet():
-        # proactive interjection when an agent blocks, or when a pane Mate
-        # delegated to this call finishes (kills the "let me check again" loop)
-        async for msg in herdr.events(["pane.agent_status_changed"]):
-            data = msg.get("data", {})
-            status = (data.get("agent_status")
-                      or data.get("pane", {}).get("agent_status"))
-            pane_id = (data.get("pane_id")
-                       or data.get("pane", {}).get("pane_id"))
+        # Proactive interjection when an agent blocks, or when a pane Mate
+        # delegated to finishes (kills the "let me check again" loop).
+        #
+        # herdr's pane.agent_status_changed subscription is PER-PANE: a bare
+        # {"type": ...} is rejected with invalid_request (missing pane_id).
+        # So each cycle: snapshot -> subscribe to every current pane ->
+        # resubscribe every WATCH_RESUBSCRIBE_SECS to pick up new panes.
+        # The snapshot doubles as a catch-up pass for delegated panes that
+        # finished while we weren't subscribed.
+        async def announce(status, pane_id, data):
             if status == "blocked":
                 await session.generate_reply(
                     instructions="Briefly tell the user this agent just got "
@@ -327,6 +335,47 @@ async def entrypoint(ctx: JobContext):
                                  "finished. Use agent_report on pane "
                                  f"{pane_id}, then give the user a one- or "
                                  "two-sentence summary of what it did.")
+
+        while True:
+            try:
+                snap = await herdr.snapshot()
+                # catch-up: delegated panes that finished between
+                # subscriptions (idle/done only -- re-announcing "blocked"
+                # every cycle would nag)
+                for a in snap.get("agents", []):
+                    if (a.get("pane_id") in mate.delegated
+                            and a.get("agent_status") in ("idle", "done")):
+                        await announce(a["agent_status"], a["pane_id"], a)
+                pane_ids = [p["pane_id"] for p in snap.get("panes", [])
+                            if p.get("pane_id")]
+                if not pane_ids:
+                    await asyncio.sleep(WATCH_RESUBSCRIBE_SECS)
+                    continue
+                events = herdr.events(
+                    [{"type": "pane.agent_status_changed", "pane_id": p}
+                     for p in pane_ids])
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + WATCH_RESUBSCRIBE_SECS
+                try:
+                    while (remaining := deadline - loop.time()) > 0:
+                        # only the WAIT is under a timeout -- announce() can
+                        # hold the floor for 10+ s of TTS and must never be
+                        # cancelled mid-speech by the resubscribe deadline
+                        try:
+                            msg = await asyncio.wait_for(
+                                anext(events), remaining)
+                        except (StopAsyncIteration, asyncio.TimeoutError):
+                            break
+                        data = msg.get("data", {})
+                        await announce(data.get("agent_status"),
+                                       data.get("pane_id"), data)
+                finally:
+                    await events.aclose()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("watch_fleet: watcher error, retrying in 5s")
+                await asyncio.sleep(5)
 
     mate = Mate(herdr)
     watcher = asyncio.create_task(watch_fleet())
