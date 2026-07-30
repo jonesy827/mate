@@ -44,8 +44,37 @@ LLM_URL = os.environ.get("LLM_URL", "http://localhost:8003/v1")
 STT_URL = os.environ.get("STT_URL", "http://localhost:8001/v1")
 TTS_URL = os.environ.get("TTS_URL", "http://localhost:8880/v1")
 LLM_MODEL = os.environ.get("LLM_MODEL", "qwen3.6-35b-a3b-long")
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "local")
 STT_MODEL = os.environ.get("STT_MODEL", "Systran/faster-whisper-medium")
 TTS_VOICE = os.environ.get("TTS_VOICE", "af_heart")
+
+
+def llm_options() -> dict:
+    """kwargs for the voice-brain openai.LLM.
+
+    The sampling block is local-only tuning: a real LLM_API_KEY means a
+    hosted provider, and those reject params they don't allow (OpenAI 400s
+    on top_k, and gpt-5-era models on any non-default temperature), so
+    hosted runs on provider defaults.
+    """
+    opts: dict = {"base_url": LLM_URL, "api_key": LLM_API_KEY,
+                  "model": LLM_MODEL}
+    if LLM_API_KEY == "local":
+        opts.update(
+            # Official qwen rec for non-thinking mode: temp 0.7, top_p 0.8,
+            # top_k 20. At temp 0.2 Mate repeated identical sentences
+            # verbatim in live testing.
+            temperature=0.7,
+            extra_body={
+                # llama.cpp: never emit <think> blocks in a voice pipeline
+                "chat_template_kwargs": {"enable_thinking": False},
+                "top_p": 0.8,
+                "top_k": 20,
+                # server default presence_penalty=1.5 breaks tool calling
+                "presence_penalty": 0,
+            },
+        )
+    return opts
 
 # pane.agent_status_changed subscriptions are per-pane, so the fleet watcher
 # resubscribes on this interval to pick up panes created since (spawn_task
@@ -731,9 +760,15 @@ async def check_endpoints() -> dict[str, str | None]:
     errors: dict[str, str | None] = {}
     async with httpx.AsyncClient(timeout=3.0) as client:
         for name, url in targets.items():
+            # local servers ignore the header; against a hosted LLM this
+            # makes the probe a real auth check
+            headers = ({"Authorization": f"Bearer {LLM_API_KEY}"}
+                       if name == "llm" else None)
             try:
-                r = await client.get(url)
-                errors[name] = None if r.status_code < 500 else f"HTTP {r.status_code}"
+                r = await client.get(url, headers=headers)
+                bad_auth = name == "llm" and r.status_code in (401, 403)
+                errors[name] = (None if r.status_code < 500 and not bad_auth
+                                else f"HTTP {r.status_code}")
             except Exception as e:
                 errors[name] = f"{type(e).__name__}: {e}"
     try:
@@ -800,21 +835,7 @@ async def entrypoint(ctx: JobContext):
     session = AgentSession(
         vad=silero.VAD.load(),
         stt=openai.STT(base_url=STT_URL, api_key="local", model=STT_MODEL),
-        llm=openai.LLM(
-            base_url=LLM_URL, api_key="local", model=LLM_MODEL,
-            # Official qwen rec for non-thinking mode: temp 0.7, top_p 0.8,
-            # top_k 20. At temp 0.2 Mate repeated identical sentences
-            # verbatim in live testing.
-            temperature=0.7,
-            extra_body={
-                # llama.cpp: never emit <think> blocks in a voice pipeline
-                "chat_template_kwargs": {"enable_thinking": False},
-                "top_p": 0.8,
-                "top_k": 20,
-                # server default presence_penalty=1.5 breaks tool calling
-                "presence_penalty": 0,
-            },
-        ),
+        llm=openai.LLM(**llm_options()),
         # "tts-1" (not "kokoro"): the plugin treats unknown model names as
         # OpenAI's SSE-streaming models and parses the response as SSE JSON,
         # but kokoro returns raw audio bytes -> "no audio frames were pushed".
