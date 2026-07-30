@@ -1,5 +1,4 @@
-"""Reading Claude Code session transcripts (shared by agent.py and the
-Telegram bridge).
+"""Reading Claude Code session transcripts for agent_report.
 
 Claude Code writes one JSONL transcript per session under
 ~/.claude/projects/<munged-cwd>/<session-id>.jsonl. herdr's integration hook

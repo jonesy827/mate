@@ -9,8 +9,8 @@ dependencies = [
     # knobs). Bump deliberately, then re-test with a real call.
     "livekit-agents[openai,silero]==1.6.7",
     "python-dotenv==1.2.2",
-    # agent.py (endpoint preflight) and notify.py (Telegram) import it
-    # unconditionally -- it is not just a test dependency
+    # agent.py (endpoint preflight) imports it unconditionally -- it is
+    # not just a test dependency
     "httpx==0.28.1",
 ]
 

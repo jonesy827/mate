@@ -63,7 +63,6 @@ The short version:
 |---|---|
 | `MATE_ALLOWED_NUMBERS` | **required** for `dev`/`start`: comma-separated E.164 numbers allowed to call in (e.g. `+14055551234`). The worker refuses to start without it, and any SIP caller not on the list is hung up on before Mate says a word. |
 | `LIVEKIT_URL` / `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | LiveKit Cloud project the worker registers with |
-| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | Telegram bridge (below); unset = notifications off |
 | `LLM_URL` `STT_URL` `TTS_URL` | override local endpoints (defaults `:8003` `:8001` `:8880`) |
 | `LLM_MODEL` `STT_MODEL` `TTS_VOICE` | model/voice overrides (default voice `af_heart`) |
 | `HERDR_SOCKET` | herdr control socket (default `~/.config/herdr/herdr.sock`) |
@@ -196,55 +195,6 @@ Workarounds:
   framing, etc.) is documented in the module docstring and enforced by
   `tests/test_herdr_client.py`'s fake server.
 
-## Telegram notifications (`telegram_bridge`)
-
-A standalone daemon pushes fleet events to your phone — "songhaus: agent
-finished" plus the agent's last reply — and routes typed replies back to
-agents. It runs outside any voice session (the voice agent's watcher only
-lives during a call). Started by hand, never at boot:
-
-```sh
-.venv/bin/python -m matebridge.telegram_bridge
-```
-
-### One-time setup
-
-1. In Telegram, open **@BotFather** → `/newbot` → pick a display name
-   (e.g. "Mate") and a unique username ending in `bot`. BotFather replies
-   with the **bot token** (`123456789:AA...`).
-2. Optional hardening: `/setjoingroups` → Disable.
-3. **Message your new bot once** (search its username, Start, say "hi") —
-   bots cannot initiate chats.
-4. Get your numeric **chat id**:
-   ```sh
-   curl -s "https://api.telegram.org/bot<TOKEN>/getUpdates" | python -m json.tool
-   # chat id = result[0].message.chat.id
-   ```
-5. Put both in `.env` here (gitignored; keep it private):
-   ```sh
-   cat >> .env <<'EOF'
-   TELEGRAM_BOT_TOKEN=123456789:AA...
-   TELEGRAM_CHAT_ID=987654321
-   EOF
-   chmod 600 .env
-   ```
-6. Verify:
-   ```sh
-   curl -s -X POST "https://api.telegram.org/bot<TOKEN>/sendMessage" \
-        -d chat_id=<ID> -d text="mate online"    # phone buzzes
-   ```
-
-### Talking back from the phone
-
-- **Reply** to any bridge notification → your text goes to that agent.
-- `songhaus: run the tests` → prefix-matches a workspace label and goes to
-  its agent.
-
-Typed text is deterministic input, so there is no confirmation rail here
-(unlike voice). Messages from any chat id other than yours are dropped
-silently. The bot token is a credential — anyone holding it controls the
-bot. BotFather `/revoke` rotates it.
-
 ## Development
 
 ```sh
@@ -267,8 +217,6 @@ other files).
 | `transcripts.py` | reading claude session transcripts for `agent_report` |
 | `safety.py` | transcript approval / veto detection for the rail |
 | `allowlist.py` | caller allowlist: normalization + fail-closed matching |
-| `notify.py` | Telegram send helper |
-| `telegram_bridge.py` | standalone phone↔fleet daemon |
 | `scripts/smoke_llm.py` | quick local-LLM sanity check |
 
 ## License

@@ -32,7 +32,6 @@ from livekit.agents import (
 )
 from livekit.plugins import openai, silero
 
-from . import notify
 from .allowlist import ENV_VAR, allowed_callers, is_allowed, sip_caller
 from .folders import KnownAgents, resolve_folder, speakable_path
 from .herdr_client import HerdrClient, HerdrError, protocol_note
@@ -772,7 +771,6 @@ async def entrypoint(ctx: JobContext):
 
     async def _reject_call(caller: str) -> None:
         logger.warning("blocked call from %s: not in %s", caller, ENV_VAR)
-        await notify.send_telegram(f"mate: blocked call from {caller}")
         try:
             await ctx.api.room.delete_room(
                 lk_api.DeleteRoomRequest(room=ctx.room.name))
