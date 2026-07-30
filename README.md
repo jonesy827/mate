@@ -1,40 +1,10 @@
 # mate
 
-Voice bridge: phone-call "Mate", a hands-free assistant that supervises a
-fleet of coding agents running in [herdr](https://herdr.dev). Built to be
-used from the car — spawn agents, hand them tasks, hear their results, all
-over a real phone call.
-
-This repo is a **reference implementation**: the as-deployed source of one
-working personal system, MIT-licensed so you can lift whatever is useful.
-Expect to read and adapt, not `pip install`.
-
-## The part worth stealing: a code-enforced confirmation rail
-
-Putting a voice call in front of coding agents that run with your full user
-permissions has an obvious failure mode: transcription is lossy, and an LLM
-can be talked into anything. So the core rule is enforced in **code, not in
-the prompt**: *nothing outward happens on one utterance.*
-
-- Outward tools (`tell_agent`, `spawn_task`, `spawn_in_folder`) don't send —
-  they **stage** the action and read it back word for word.
-- Delivery happens only when the model calls `send_staged` *and* code (not
-  the LLM) verifies that the raw transcript of a **new** user turn contains
-  a clear yes with no veto words (`safety.py`). The model can call
-  `send_staged` all it likes; if the human didn't say yes, nothing moves.
-- Approving an agent's pending TUI prompt takes the same rail when the
-  on-screen action looks destructive — `send_answer` stages the keys, and
-  **there is no bypass tool for the model to find**.
-- "Guardrails off" (a voice toggle, also detected in code) switches
-  messaging and spawns to immediate delivery for low-friction sessions —
-  but it **never** bypasses destructive-approval staging.
-
-The rail guards against lossy transcription and model over-eagerness, not
-attackers — see the threat model below for what actually keeps hostile
-callers out. Everything else in the repo — SIP plumbing, herdr workarounds,
-transcript adapters — is supporting cast around this design.
-
-## Architecture
+Call a phone number, talk to "Mate", and it drives a fleet of coding agents
+running in [herdr](https://herdr.dev) — spawn agents, hand them tasks, hear
+their results. I built it because I wanted to check on and update my Claude
+Code sessions from the car. It's a working proof of concept with basic
+security, MIT-licensed, published as-is.
 
 ```
 your phone
@@ -55,13 +25,36 @@ herdr unix socket (~/.config/herdr/herdr.sock)
 ```
 
 Media/infra services live in `../matebridge-infra` — see its README for
-bring-up. **Nothing in this project starts at boot.**
+bring-up. Nothing in this project starts at boot.
+
+## Confirmation rail
+
+Voice transcription is lossy, so nothing outward happens on one utterance.
+`tell_agent` / `spawn_task` / `spawn_in_folder` stage the action and read it
+back; delivery needs a spoken yes in a **new** turn, verified in code — not
+by the LLM. Destructive-looking TUI approvals take the same rail, with no
+bypass tool. "Guardrails off" (voice toggle, also detected in code) makes
+messaging and spawns immediate but never skips destructive approvals.
+
+## Security
+
+Basic, deliberately. Know what you're deploying:
+
+- The caller allowlist (`MATE_ALLOWED_NUMBERS`, enforced fail-closed in the
+  worker and again on the LiveKit trunk) is the only barrier against
+  hostile callers — and caller ID can be spoofed by a targeted attacker.
+- The rail catches bad transcription, not attackers; an attacker says yes
+  to their own staged action.
+- An allowed caller drives agents with your full user permissions. The
+  destructive-prompt regex (`safety.py`) is a heuristic, not a boundary.
+- A hosted voice brain (`LLM_API_KEY` set) sends call transcripts and agent
+  output to the provider; the default stack is all local.
 
 ## Running
 
-Prereqs: infra services up (see `../matebridge-infra`), the llama.cpp unit
-started by hand (`systemctl --user start llama-qwen-long`), and herdr
-running (`tmux new-session -d -s herdr-host herdr`).
+Prereqs: infra services up (see `../matebridge-infra`), llama.cpp started
+(`systemctl --user start llama-qwen-long`), herdr running
+(`tmux new-session -d -s herdr-host herdr`).
 
 ```sh
 .venv/bin/python -m mate.agent console   # desk test: terminal mic/speaker
@@ -69,177 +62,91 @@ set -a && source .env && set +a
 .venv/bin/python -m mate.agent dev       # real worker: registers with LiveKit
 ```
 
-The worker preflights llm/stt/tts/herdr and refuses to start with a clear
-list of whatever is unreachable. Once registered, an inbound call to the DID
-dispatches a job and Mate answers.
+The worker preflights llm/stt/tts/herdr and refuses to start if any are
+unreachable. Two rules learned the hard way:
 
-Two operational rules learned the hard way:
-
-- **Never restart the worker during a call** — check first:
-  `lk room list | grep mate-call-` must be empty.
-- Dev-mode job processes re-import the code per call, so edits usually go
-  live on the *next* call without a restart; restart anyway (between calls)
-  when you need certainty.
+- Never restart the worker during a call — `lk room list | grep mate-call-`
+  must be empty first.
+- Dev-mode re-imports code per call, so edits usually go live on the next
+  call; restart between calls when you need certainty.
 
 ## Configuration (`.env`, gitignored, chmod 600)
 
-Copy `.env.example` to `.env` and fill it in — it documents every variable.
-The short version:
+Copy `.env.example` to `.env` — it documents every variable.
 
 | var | purpose |
 |---|---|
-| `MATE_ALLOWED_NUMBERS` | **required** for `dev`/`start`: comma-separated E.164 numbers allowed to call in (e.g. `+14055551234`). The worker refuses to start without it, and any SIP caller not on the list is hung up on before Mate says a word. |
-| `LIVEKIT_URL` / `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | LiveKit Cloud project the worker registers with |
+| `MATE_ALLOWED_NUMBERS` | **required**: comma-separated E.164 numbers allowed to call in. Anyone else is hung up on before Mate says a word. |
+| `LIVEKIT_URL` / `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | LiveKit Cloud project |
 | `LLM_URL` `STT_URL` `TTS_URL` | override local endpoints (defaults `:8003` `:8001` `:8880`) |
 | `LLM_MODEL` `STT_MODEL` `TTS_VOICE` | model/voice overrides (default voice `af_heart`) |
-| `LLM_API_KEY` | default `local` (no auth, qwen-tuned sampling). Set a real key + `LLM_URL=https://api.openai.com/v1` + an `LLM_MODEL` to run the voice brain on the OpenAI API — usage-billed API key only; a ChatGPT subscription has no API access |
+| `LLM_API_KEY` | default `local`. Set a real key + `LLM_URL=https://api.openai.com/v1` + `LLM_MODEL` to use the OpenAI API (usage-billed key; a ChatGPT subscription has no API access) |
 | `HERDR_SOCKET` | herdr control socket (default `~/.config/herdr/herdr.sock`) |
 | `MATE_SRC_ROOTS` | colon-separated roots `spawn_in_folder` searches (default `~/src`) |
 | `MATE_CLAUDE_PROJECTS` | Claude Code transcript dir (default `~/.claude/projects`) |
 
-`.env` holds real credentials — never commit it, never paste it into logs.
+## Phone/SIP setup (one-time, as deployed)
 
-## One-time phone/SIP setup (as deployed)
-
-Self-hosted LiveKit was abandoned (it hard-crashed this host twice — see the
-infra README); the live path uses **LiveKit Cloud SIP**:
-
-1. **Telnyx**: buy a DID, create a SIP connection/trunk, point its
-   destination at your LiveKit Cloud project's SIP URI, assign the DID to it.
-2. **LiveKit Cloud** (with `lk` configured for the project):
+1. **Telnyx**: buy a DID, create a SIP trunk pointed at your LiveKit Cloud
+   project's SIP URI, assign the DID.
+2. **LiveKit Cloud** (`lk` configured for the project):
 
    ```sh
-   # inbound trunk accepting the DID (ours: ST_4yZYpgU6A4cs "telnyx-inbound")
    lk sip inbound create trunk.json     # numbers: ["+14052790756"]
-
-   # dispatch rule: one room per caller (ours: SDR_CZAxhc79FxHU "mate-calls")
    lk sip dispatch create dispatch.json # individual/caller → mate-call-_<caller>_<random>
    ```
-3. Run the worker (`... agent dev`). It registers with the Cloud project;
-   inbound calls dispatch to it automatically.
+3. Set `AllowedNumbers` on the trunk to match `MATE_ALLOWED_NUMBERS`, then
+   run the worker.
 
-Also set `AllowedNumbers` on the inbound trunk to the same list as
-`MATE_ALLOWED_NUMBERS` — that rejects unknown callers before a room is even
-dispatched. The worker enforces its own allowlist regardless, so a missed
-trunk setting is not an open door.
+(Self-hosted LiveKit was abandoned — it hard-crashed this host twice; see
+the infra README.)
 
-## Threat model
+## Tools
 
-Read this before pointing a phone number at your terminal:
+`src/mate/agent.py` defines the `Mate` agent:
 
-- **The caller allowlist is the only boundary against a hostile caller.**
-  The confirmation rail exists to catch lossy *transcription*, not
-  attackers — a hostile caller happily says "yes" to their own staged
-  action. Everything hinges on who can get a session.
-- **Caller ID is not cryptographic identity.** It is asserted by the
-  originating carrier, and VoIP origination lets anyone assert anything.
-  The allowlist stops strangers who find the DID; it does not stop a
-  targeted attacker who knows both your DID and an allowed number and
-  spoofs it. If that is in your threat model, don't deploy this as-is (a
-  spoken-PIN second factor is on the wishlist).
-- **The destructive-action regex (`safety.py`) is a heuristic, not a
-  security boundary.** It decides which TUI approvals get the extra
-  spoken-confirmation rail; a prompt it fails to flag goes through on one
-  utterance. Treat it as a seatbelt for the legitimate user.
-- A caller who passes the allowlist can drive coding agents that run
-  with your user account's full permissions. There is no sandbox beyond
-  whatever the agents themselves enforce.
-- **A hosted voice brain ships your data off-box.** With `LLM_API_KEY`
-  set, every transcript, fleet status, and agent reply Mate handles goes
-  to the provider. The default all-local stack keeps calls on your
-  machine (minus ordinary phone carriage).
+- **Fleet**: `fleet_status`, `read_pane`, `agent_report` (reads real replies
+  from the session transcript), `wait_for_agent`, `list_known_agents` /
+  `forget_agent`.
+- **Acting**: `tell_agent`, `spawn_task` (new worktree + branch),
+  `spawn_in_folder`, `send_answer` (TUI prompts).
+- **Rail**: `send_staged` / `discard_staged`.
 
-## How Mate works
+Spawns return immediately; a background deliverer hands the task over once
+the agent boots (up to 120 s). `watch_fleet` announces deliveries and
+finishes during the call, speaking a sanitized two-sentence summary. A
+`Delegations` clock stops "finished" announcements for panes that were never
+seen working (herdr may still be typing); those get one Enter nudge instead.
 
-`src/mate/agent.py` defines the `Mate` agent and its tools:
+## herdr notes (`herdr_client.py`)
 
-- **Fleet**: `fleet_status`, `read_pane`, `agent_report` (reads the agent's
-  actual replies from its session transcript), `wait_for_agent`,
-  `list_known_agents` / `forget_agent`.
-- **Acting on agents**: `tell_agent` (message a pane's agent), `spawn_task`
-  (new worktree + branch), `spawn_in_folder` (workspace directly in an
-  existing folder; empty task means "open ready and wait"), `send_answer`
-  (answer TUI prompts; a destructive-looking prompt is staged through the
-  rail instead of sent — there is no bypass tool).
-- **Rail**: `send_staged` / `discard_staged` — the delivery mechanics of the
-  code-enforced rail described up top.
+Tested against herdr 0.7.5 (protocol 17); mate never patches herdr — these
+are client-side workarounds, each pinned by a test. A protocol mismatch is
+logged as a warning, not a refusal to start.
 
-### Background delivery and the watcher
+- **Names sanitized**: agent names folded to `^[a-z][a-z0-9_-]{0,31}$`.
+- **Slow boot ≠ failed launch**: prompt delivery retries `agent_not_ready`
+  for up to 120 s; `timeout_ms` stretches herdr's 30 s launch deadline.
+- **Stuck-launch fallback** (0.7.5 bug): a launch can stay `launch_pending`
+  forever while the agent idles. After ~20 s of refusals, if `agent.list`
+  proves a settled agent owns the pane, the message is typed in directly —
+  never into a bare shell.
+- **Dropped-prompt fallback** (0.7.5 bug): on worktree panes `agent.prompt`
+  claims success but types nothing. A landed prompt advances
+  `state_change_seq`; if it stays frozen, type-in fallback, same guard.
+- **Enter nudge**: Claude Code's paste guard sometimes eats herdr's Enter;
+  every delivery is followed ~2 s later by one bare Enter.
 
-Spawns return immediately; the task is handed over by a background deliverer
-that waits out the agent's whole boot (up to 120 s). During a call,
-`watch_fleet` subscribes to pane status events and announces deliveries and
-finishes ("Hey mate, the songhaus agent just finished…"), speaking a
-sanitized two-sentence summary (`tts_sanitize` / `tts_summary` — so agents'
-final replies should front-load the key finding). A `Delegations` clock
-guards the race where a pane looks idle only because herdr is still typing:
-"finished" is announced only for panes that were actually seen working, and
-a pane that never starts gets one Enter nudge instead of a stale
-announcement.
+### Other harnesses
 
-## herdr integration notes (`herdr_client.py`)
-
-herdr is an external project — mate **never patches it**; everything
-below is a client-side workaround, each pinned by a test.
-
-Tested against **herdr 0.7.5 (protocol 17)**. The worker logs herdr's
-version at startup (the preflight ping already carries it) and warns —
-without refusing to run — when the protocol differs: the workarounds
-degrade to no-ops on a herdr that behaves, and real breakage surfaces
-loudly as spoken tool errors, so a hard version gate would only turn
-every herdr upgrade into a refusal to start.
-
-Workarounds:
-
-- **Names are sanitized**: herdr agent names must match
-  `^[a-z][a-z0-9_-]{0,31}$`; any folder/branch label is folded to fit
-  ("RackCoach" → "rackcoach") before `agent.start`.
-- **A slow boot is not a failed launch**: the workspace is torn down only if
-  `agent.start` itself fails. Prompt delivery retries `agent_not_ready` for
-  up to 120 s, and `timeout_ms` stretches herdr's own 30 s launch deadline
-  to match.
-- **Stuck-launch fallback** (herdr 0.7.5 bug, seen live twice): a managed
-  launch can stay `launch_pending` forever while the agent is visibly idle,
-  refusing every prompt. After ~20 s of refusals, if `agent.list` proves a
-  settled coding agent owns the pane, the message is typed into the pane
-  directly. The fallback **never** fires on a bare shell — typed task text
-  would execute as a shell command.
-- **Dropped-prompt fallback** (herdr 0.7.5 bug, found live-testing the
-  worktree path): on a worktree-workspace pane, `agent.prompt` answers
-  `agent_prompted` but never types anything. A landed prompt always
-  advances the agent's `state_change_seq`; when it stays frozen after an
-  accepted prompt, the message is typed into the pane directly — same
-  settled-agent guard as above, never into a bare shell.
-- **Enter nudge**: Claude Code's paste guard sometimes swallows the Enter
-  herdr sends after typing, leaving the message stuck in the input box.
-  Every delivery is followed ~2 s later by one bare Enter — no-op if the
-  message submitted, rescue if it didn't.
-- Protocol ground truth (one request per connection, events.subscribe
-  framing, etc.) is documented in the module docstring and enforced by
-  `tests/test_herdr_client.py`'s fake server.
-
-### Multi-harness support
-
-herdr can host many agent kinds (`claude`, `codex`, `gemini`, `opencode`,
-`amp`, … — `herdr agent start --help` lists them all). Where mate stands:
-
-- **Works with any kind herdr supports**: spawning (`spawn_task` and
-  `spawn_in_folder` take an `agent` kind — "spawn a codex agent in
-  songhaus"), messaging, TUI answers, status watching, and finish
-  announcements — all of it rides on herdr's own abstractions.
-- **Per-harness**: `agent_report` and spoken reply summaries need to read
-  the harness's session transcript, which lives in a different place and
-  format for every harness. Adapters are registered in `transcripts.py`'s
-  `ADAPTERS` — currently **claude only**. Other kinds get a clean "use
-  read_pane instead" answer and generic finish announcements.
-
-Adding a harness is one function: given the agent's cwd and session id
-(herdr reports both), return its last assistant replies. Register it in
-`ADAPTERS` and everything above lights up. Codex is next on the wishlist.
-
-Caveat: `safety.py`'s destructive-prompt heuristic is tuned to Claude
-Code's TUI approval wording — another harness's approval prompt may not
-trip the extra spoken-confirmation rail (see threat model).
+herdr hosts many agent kinds (`claude`, `codex`, `gemini`, …). Spawning,
+messaging, TUI answers, and status watching work for any kind (`spawn_task`
+/ `spawn_in_folder` take an `agent` kind). Transcript readback
+(`agent_report`, spoken summaries) needs a per-harness adapter in
+`transcripts.py` `ADAPTERS` — currently claude only; other kinds get "use
+read_pane instead". Adding one is a single function: given cwd + session id,
+return the last assistant replies. Note `safety.py`'s destructive-prompt
+regex is tuned to Claude Code's approval wording.
 
 ## Development
 
@@ -248,20 +155,16 @@ trip the extra spoken-confirmation rail (see threat model).
 .venv/bin/ruff check src/ tests/
 ```
 
-CI (GitHub Actions) runs both on every push and PR.
-
-Every live-discovered bug gets a pinning test before (or with) its fix; the
-suite runs with no network, herdr, or GPU — herdr is faked at the protocol
-level (`test_herdr_client.py`) or the client level (recording fakes in the
-other files).
+CI runs both on every push. Every live-discovered bug gets a pinning test;
+the suite needs no network, herdr, or GPU.
 
 | module | role |
 |---|---|
 | `agent.py` | the Mate voice agent: tools, rail, watcher, entrypoint |
 | `herdr_client.py` | async herdr socket client + spawn/delivery logic |
 | `folders.py` | folder-name → path resolution for `spawn_in_folder` |
-| `transcripts.py` | per-harness transcript adapters for `agent_report` (claude today) |
-| `safety.py` | transcript approval / veto detection for the rail |
+| `transcripts.py` | per-harness transcript adapters (claude today) |
+| `safety.py` | approval / veto detection for the rail |
 | `allowlist.py` | caller allowlist: normalization + fail-closed matching |
 | `scripts/smoke_llm.py` | quick local-LLM sanity check |
 
