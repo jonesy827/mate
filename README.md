@@ -5,9 +5,38 @@ fleet of coding agents running in [herdr](https://herdr.dev). Built to be
 used from the car — spawn agents, hand them tasks, hear their results, all
 over a real phone call.
 
-(The Python package is still named `matebridge`, so commands and module
-paths below say `matebridge` — that's the import name, not the project
-name.)
+This repo is a **reference implementation**: the as-deployed source of one
+working personal system, MIT-licensed so you can lift whatever is useful.
+Expect to read and adapt, not `pip install`. (The Python package is still
+named `matebridge`, so commands and module paths below say `matebridge` —
+that's the import name, not the project name.)
+
+## The part worth stealing: a code-enforced confirmation rail
+
+Putting a voice call in front of coding agents that run with your full user
+permissions has an obvious failure mode: transcription is lossy, and an LLM
+can be talked into anything. So the core rule is enforced in **code, not in
+the prompt**: *nothing outward happens on one utterance.*
+
+- Outward tools (`tell_agent`, `spawn_task`, `spawn_in_folder`) don't send —
+  they **stage** the action and read it back word for word.
+- Delivery happens only when the model calls `send_staged` *and* code (not
+  the LLM) verifies that the raw transcript of a **new** user turn contains
+  a clear yes with no veto words (`safety.py`). The model can call
+  `send_staged` all it likes; if the human didn't say yes, nothing moves.
+- Approving an agent's pending TUI prompt takes the same rail when the
+  on-screen action looks destructive — `send_answer` stages the keys, and
+  **there is no bypass tool for the model to find**.
+- "Guardrails off" (a voice toggle, also detected in code) switches
+  messaging and spawns to immediate delivery for low-friction sessions —
+  but it **never** bypasses destructive-approval staging.
+
+The rail guards against lossy transcription and model over-eagerness, not
+attackers — see the threat model below for what actually keeps hostile
+callers out. Everything else in the repo — SIP plumbing, herdr workarounds,
+transcript adapters — is supporting cast around this design.
+
+## Architecture
 
 ```
 your phone
@@ -134,23 +163,8 @@ Read this before pointing a phone number at your terminal:
   existing folder; empty task means "open ready and wait"), `send_answer`
   (answer TUI prompts; a destructive-looking prompt is staged through the
   rail instead of sent — there is no bypass tool).
-- **Rail**: `send_staged` / `discard_staged`.
-
-### The stage-and-confirm rail
-
-Voice transcription is lossy, so nothing outward happens on one utterance.
-`tell_agent` / `spawn_task` / `spawn_in_folder` **stage** the action and read
-it back word for word; delivery happens only when `send_staged` runs *and*
-code (not the LLM) verifies the raw transcript of a **new** user turn
-contains a clear yes with no veto words. Saying "guardrails off" (voice
-toggle, detected in code) switches to immediate delivery; "guardrails on"
-restores the rail.
-
-Approving an agent's pending TUI prompt takes the same rail when the
-on-screen action looks destructive (`safety.py`'s heuristic): `send_answer`
-stages the keys and delivery needs the same code-verified spoken yes.
-"Guardrails off" does **not** bypass this — the toggle covers messaging and
-spawn convenience, never destructive approvals.
+- **Rail**: `send_staged` / `discard_staged` — the delivery mechanics of the
+  code-enforced rail described up top.
 
 ### Background delivery and the watcher
 
