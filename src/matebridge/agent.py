@@ -78,6 +78,9 @@ Always refresh state with tools before reporting status; never answer from memor
 For "what did the agent say/find/conclude", prefer agent_report (full replies from
 its transcript). Use read_pane for what is on screen now: pending prompts, errors,
 running commands.
+After delegating work with tell_agent or spawn_task, NEVER poll or re-check on
+your own. Quick question: call wait_for_agent once. Anything longer: tell the
+user you'll be notified when it finishes — you will be, automatically.
 Resolve casual project names to workspace labels via fleet_status. If a reference
 is genuinely ambiguous, ask one short question instead of guessing.
 Before approving anything an agent is waiting on, read its pane and tell the user
@@ -89,6 +92,8 @@ class Mate(Agent):
         super().__init__(instructions=INSTRUCTIONS)
         self.herdr = herdr
         self._read_panes: set[str] = set()  # rails: read before approve
+        # panes given work this call; watch_fleet announces when they finish
+        self.delegated: set[str] = set()
 
     @function_tool
     async def fleet_status(self, ctx: RunContext):
@@ -146,12 +151,8 @@ class Mate(Agent):
             return f"ERROR: {e.code}: {e.message} (pane {pane_id})"
         return "sent"
 
-    @function_tool
-    async def agent_report(self, ctx: RunContext, pane_id: str,
-                           messages: int = 1):
-        """Read the coding agent's last full reply/replies from its session
-        transcript. Better than read_pane for "what did it say/find" — screen
-        scrollback loses long answers, the transcript never does."""
+    async def _agent_replies(self, pane_id: str, messages: int = 1) -> str:
+        """Last replies from the pane's claude transcript, or an ERROR string."""
         try:
             snap = await self.herdr.snapshot()
         except HerdrError as e:
@@ -176,6 +177,42 @@ class Mate(Agent):
         return "\n\n---\n\n".join(replies)[-8000:]
 
     @function_tool
+    async def agent_report(self, ctx: RunContext, pane_id: str,
+                           messages: int = 1):
+        """Read the coding agent's last full reply/replies from its session
+        transcript. Better than read_pane for "what did it say/find" — screen
+        scrollback loses long answers, the transcript never does."""
+        return await self._agent_replies(pane_id, messages)
+
+    @function_tool
+    async def wait_for_agent(self, ctx: RunContext, pane_id: str,
+                             seconds: int = 15):
+        """Wait briefly (max 20s) for a busy agent to finish, then return its
+        reply. Use after tell_agent for QUICK questions only. If it is still
+        working when time runs out, do NOT call again — the user will be
+        notified automatically when the agent finishes."""
+        deadline = asyncio.get_event_loop().time() + max(1, min(seconds, 20))
+        status = "unknown"
+        while asyncio.get_event_loop().time() < deadline:
+            try:
+                snap = await self.herdr.snapshot()
+            except HerdrError as e:
+                return f"ERROR: {e.code}: {e.message}"
+            agent = next((a for a in snap.get("agents", [])
+                          if a.get("pane_id") == pane_id), None)
+            if agent is None:
+                return f"ERROR: no coding agent is registered in pane {pane_id}."
+            status = agent.get("agent_status", "unknown")
+            if status in ("idle", "done", "blocked"):
+                self.delegated.discard(pane_id)
+                reply = await self._agent_replies(pane_id)
+                return f"agent finished (status: {status}). Its reply:\n{reply}"
+            await asyncio.sleep(1.0)
+        return (f"agent is still {status}. STOP checking — the user will be "
+                "notified automatically the moment it finishes. Tell them "
+                "that and move on.")
+
+    @function_tool
     async def tell_agent(self, ctx: RunContext, pane_id: str, text: str):
         """Send a natural-language instruction to a coding agent running in a pane."""
         try:
@@ -187,7 +224,10 @@ class Mate(Agent):
                         "another integrated agent) is launched inside a herdr pane. "
                         "Tell the user that pane has no agent to talk to.")
             return f"ERROR: {e.code}: {e.message} (pane {pane_id})"
-        return "delivered"
+        self.delegated.add(pane_id)
+        return ("delivered. For a quick question, call wait_for_agent once. "
+                "For anything longer, tell the user they'll be notified when "
+                "it finishes — do not check again on your own.")
 
     @function_tool
     async def spawn_task(self, ctx: RunContext, repo_path: str, branch: str,
@@ -197,6 +237,8 @@ class Mate(Agent):
             result = await self.herdr.spawn(repo_path, branch, task)
         except HerdrError as e:
             return f"ERROR: {e.code}: {e.message}"
+        if result.get("pane_id"):
+            self.delegated.add(result["pane_id"])
         return json.dumps(result)
 
 
@@ -264,17 +306,29 @@ async def entrypoint(ctx: JobContext):
     )
 
     async def watch_fleet():
-        # proactive interjection when an agent blocks mid-call
+        # proactive interjection when an agent blocks, or when a pane Mate
+        # delegated to this call finishes (kills the "let me check again" loop)
         async for msg in herdr.events(["pane.agent_status_changed"]):
             data = msg.get("data", {})
             status = (data.get("agent_status")
                       or data.get("pane", {}).get("agent_status"))
+            pane_id = (data.get("pane_id")
+                       or data.get("pane", {}).get("pane_id"))
             if status == "blocked":
                 await session.generate_reply(
                     instructions="Briefly tell the user this agent just got "
                                  "blocked and offer to read its question: "
                                  + json.dumps(data))
+            elif (status in ("idle", "done")
+                  and pane_id in mate.delegated):
+                mate.delegated.discard(pane_id)  # one announcement per task
+                await session.generate_reply(
+                    instructions="The agent you delegated work to just "
+                                 "finished. Use agent_report on pane "
+                                 f"{pane_id}, then give the user a one- or "
+                                 "two-sentence summary of what it did.")
 
+    mate = Mate(herdr)
     watcher = asyncio.create_task(watch_fleet())
 
     async def _stop_watcher():
@@ -282,7 +336,7 @@ async def entrypoint(ctx: JobContext):
 
     ctx.add_shutdown_callback(_stop_watcher)
 
-    await session.start(agent=Mate(herdr), room=ctx.room)
+    await session.start(agent=mate, room=ctx.room)
     await session.generate_reply(
         instructions="Greet briefly: say you're here and how many agents "
                      "are running.")
