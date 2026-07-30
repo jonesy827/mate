@@ -25,8 +25,8 @@ from collections.abc import AsyncIterator, Iterable
 from pathlib import Path
 from typing import Any
 
-DEFAULT_SOCK = Path(os.environ.get(
-    "HERDR_SOCKET", Path.home() / ".config/herdr/herdr.sock"))
+DEFAULT_SOCK = Path(os.path.expanduser(os.environ.get(
+    "HERDR_SOCKET", str(Path.home() / ".config/herdr/herdr.sock"))))
 
 # The protocol this client's workarounds were verified against. A different
 # herdr is warned about at startup, never refused: the workarounds degrade

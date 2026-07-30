@@ -11,7 +11,6 @@ from matebridge.folders import (
     KnownAgents,
     resolve_folder,
     speakable_path,
-    squash,
 )
 
 pytestmark = pytest.mark.asyncio
@@ -187,7 +186,7 @@ async def test_failed_background_delivery_keeps_workspace_out_of_delegated(
 
 async def test_known_folder_gets_short_confirmation(tmp_path):
     mate, herdr = make_mate(tmp_path, "matebridge")
-    real = str((tmp_path / "src" / "matebridge"))
+    real = str(tmp_path / "src" / "matebridge")
     mate.known.remember("matebridge", real)
     out = await mate.spawn_in_folder(FakeCtx(["again"]),
                                      folder_name="matebridge",
@@ -201,7 +200,7 @@ async def test_known_folder_gets_short_confirmation(tmp_path):
 
 
 async def test_stale_memory_falls_back_to_full_confirmation(tmp_path):
-    mate, herdr = make_mate(tmp_path, "matebridge")
+    mate, _herdr = make_mate(tmp_path, "matebridge")
     mate.known.remember("matebridge", str(tmp_path / "gone"))
     out = await mate.spawn_in_folder(FakeCtx(["x"]), folder_name="matebridge",
                                      task="t")

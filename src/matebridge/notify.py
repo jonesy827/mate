@@ -62,7 +62,7 @@ async def api_call(method: str, payload: dict,
             return None
         body = r.json()
         return body.get("result") if body.get("ok") else None
-    except Exception:  # noqa: BLE001 - notifications must never crash callers
+    except Exception:
         log.exception("telegram %s failed", method)
         return None
 

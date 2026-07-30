@@ -249,7 +249,7 @@ class Mate(Agent):
         super().__init__(instructions=INSTRUCTIONS)
         self.herdr = herdr
         # name -> path memory of spawn targets the user has confirmed;
-        # roots override is for tests (default: MATEBRIDGE_SRC_ROOTS / ~/src)
+        # roots override is for tests (default: MATE_SRC_ROOTS / ~/src)
         self.known = known if known is not None else KnownAgents()
         self._roots = roots
         self._read_panes: set[str] = set()  # rails: read before approve
@@ -447,7 +447,7 @@ class Mate(Agent):
         caller then falls back to a read-this-exactly tool result."""
         try:
             session = self.session
-        except Exception:  # noqa: BLE001 - not attached yet
+        except Exception:
             return False
         if session is None:
             return False
@@ -488,7 +488,7 @@ class Mate(Agent):
     async def _nudge_after_tell(self, pane_id: str) -> None:
         try:
             await self.herdr.nudge_enter(pane_id)
-        except Exception:  # noqa: BLE001 - best-effort, never user-visible
+        except Exception:
             logger.exception("post-tell enter nudge failed for %s", pane_id)
 
     async def _deliver(self, staged: dict) -> str:
@@ -735,7 +735,7 @@ async def check_endpoints() -> dict[str, str | None]:
             try:
                 r = await client.get(url)
                 errors[name] = None if r.status_code < 500 else f"HTTP {r.status_code}"
-            except Exception as e:  # noqa: BLE001 - report anything as down
+            except Exception as e:
                 errors[name] = f"{type(e).__name__}: {e}"
     try:
         pong = await HerdrClient().call("ping")
@@ -746,7 +746,7 @@ async def check_endpoints() -> dict[str, str | None]:
         else:
             logger.info("herdr %s (protocol %s)",
                         pong.get("version"), pong.get("protocol"))
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         errors["herdr"] = f"{type(e).__name__}: {e}"
     return errors
 
@@ -776,13 +776,17 @@ async def entrypoint(ctx: JobContext):
         try:
             await ctx.api.room.delete_room(
                 lk_api.DeleteRoomRequest(room=ctx.room.name))
-        except Exception:  # noqa: BLE001 - room may already be gone
+        except Exception:
             logger.exception("could not delete room for blocked caller")
+
+    reject_tasks: set[asyncio.Task] = set()
 
     def _screen_late_joiner(participant) -> None:
         caller = sip_caller(participant.attributes)
         if caller is not None and not is_allowed(caller, allowed):
-            asyncio.create_task(_reject_call(caller))
+            t = asyncio.create_task(_reject_call(caller))
+            reject_tasks.add(t)
+            t.add_done_callback(reject_tasks.discard)
 
     # The SIP caller is normally already in the room when the job starts
     # (the dispatch rule created the room for them) — reject before the
@@ -938,7 +942,7 @@ async def entrypoint(ctx: JobContext):
                         try:
                             msg = await asyncio.wait_for(
                                 anext(events), remaining)
-                        except (StopAsyncIteration, asyncio.TimeoutError):
+                        except (TimeoutError, StopAsyncIteration):
                             break
                         data = msg.get("data", {})
                         logger.info("watch_fleet: event pane=%s status=%s",
@@ -968,7 +972,7 @@ async def entrypoint(ctx: JobContext):
         snap = await herdr.snapshot()
         n = len(snap.get("agents", []))
         fleet = f"{n} agent{'s' if n != 1 else ''} running"
-    except Exception:  # noqa: BLE001 - greet anyway, tools will surface it
+    except Exception:
         fleet = "your fleet is up"
     await session.say(f"G'day mate. {fleet}. What do you need?")
 

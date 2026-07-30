@@ -56,14 +56,19 @@ Two operational rules learned the hard way:
 
 ## Configuration (`.env`, gitignored, chmod 600)
 
+Copy `.env.example` to `.env` and fill it in — it documents every variable.
+The short version:
+
 | var | purpose |
 |---|---|
 | `MATE_ALLOWED_NUMBERS` | **required** for `dev`/`start`: comma-separated E.164 numbers allowed to call in (e.g. `+14055551234`). The worker refuses to start without it, and any SIP caller not on the list is hung up on before Mate says a word. |
 | `LIVEKIT_URL` / `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | LiveKit Cloud project the worker registers with |
-| `TELNYX_API_KEY` | Telnyx API (number/trunk management) |
-| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | Telegram bridge (below) |
+| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | Telegram bridge (below); unset = notifications off |
 | `LLM_URL` `STT_URL` `TTS_URL` | override local endpoints (defaults `:8003` `:8001` `:8880`) |
 | `LLM_MODEL` `STT_MODEL` `TTS_VOICE` | model/voice overrides (default voice `af_heart`) |
+| `HERDR_SOCKET` | herdr control socket (default `~/.config/herdr/herdr.sock`) |
+| `MATE_SRC_ROOTS` | colon-separated roots `spawn_in_folder` searches (default `~/src`) |
+| `MATE_CLAUDE_PROJECTS` | Claude Code transcript dir (default `~/.claude/projects`) |
 
 `.env` holds real credentials — never commit it, never paste it into logs.
 
@@ -244,7 +249,10 @@ bot. BotFather `/revoke` rotates it.
 
 ```sh
 .venv/bin/python -m pytest tests/ -q
+.venv/bin/ruff check src/ tests/
 ```
+
+CI (GitHub Actions) runs both on every push and PR.
 
 Every live-discovered bug gets a pinning test before (or with) its fix; the
 suite runs with no network, herdr, or GPU — herdr is faked at the protocol
@@ -262,3 +270,7 @@ other files).
 | `notify.py` | Telegram send helper |
 | `telegram_bridge.py` | standalone phone↔fleet daemon |
 | `scripts/smoke_llm.py` | quick local-LLM sanity check |
+
+## License
+
+MIT — see `LICENSE`.

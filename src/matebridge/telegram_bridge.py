@@ -177,7 +177,7 @@ class Bridge:
                         try:
                             msg = await asyncio.wait_for(
                                 anext(events), remaining)
-                        except (StopAsyncIteration, asyncio.TimeoutError):
+                        except (TimeoutError, StopAsyncIteration):
                             break
                         data = msg.get("data", {})
                         await self.handle_status(

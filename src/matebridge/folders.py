@@ -14,7 +14,7 @@ import re
 import time
 from pathlib import Path
 
-SRC_ROOTS_ENV = "MATEBRIDGE_SRC_ROOTS"  # colon-separated, default ~/src
+SRC_ROOTS_ENV = "MATE_SRC_ROOTS"  # colon-separated, default ~/src
 KNOWN_AGENTS_PATH = "~/.config/matebridge/known_agents.json"
 
 
