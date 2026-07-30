@@ -254,6 +254,13 @@ async def entrypoint(ctx: JobContext):
         # raw-audio stream path (AUDIO_STREAM_MODELS) in the plugin.
         tts=openai.TTS(base_url=TTS_URL, api_key="local", model="tts-1",
                        voice=TTS_VOICE),
+        turn_handling={
+            # Batch whisper takes ~4-5s to return a transcript, so the default
+            # 2s false-interruption window always expires first: Mate resumes
+            # speaking, then cuts off again when the transcript lands. Give
+            # STT time to confirm the interruption was real.
+            "interruption": {"false_interruption_timeout": 6.0},
+        },
     )
 
     async def watch_fleet():
