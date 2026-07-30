@@ -32,6 +32,7 @@ class HerdrError(RuntimeError):
         super().__init__(f"{method}: [{code}] {message}")
         self.method = method
         self.code = code
+        self.message = message
 
 
 class HerdrClient:

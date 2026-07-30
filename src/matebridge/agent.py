@@ -28,7 +28,7 @@ from livekit.agents import (
 )
 from livekit.plugins import openai, silero
 
-from .herdr_client import HerdrClient
+from .herdr_client import HerdrClient, HerdrError
 from .safety import is_destructive
 
 logger = logging.getLogger("matebridge")
@@ -79,7 +79,10 @@ class Mate(Agent):
     @function_tool
     async def read_pane(self, ctx: RunContext, pane_id: str, lines: int = 60):
         """Read the last lines of a pane's terminal output (what an agent is doing or asking)."""
-        text = await self.herdr.read_pane(pane_id, lines)
+        try:
+            text = await self.herdr.read_pane(pane_id, lines)
+        except HerdrError as e:
+            return f"ERROR: {e.code}: {e.message} (pane {pane_id})"
         self._read_panes.add(pane_id)
         return text[-4000:]
 
@@ -89,32 +92,49 @@ class Mate(Agent):
         if pane_id not in self._read_panes:
             return ("REFUSED: read the pane first so the user knows what "
                     "they are approving.")
-        text = await self.herdr.read_pane(pane_id, 40)
-        if is_destructive(text):
-            return ("REFUSED: the pending action looks destructive. Read it to "
-                    "the user verbatim and get explicit confirmation, then call "
-                    "send_answer_confirmed.")
-        await self.herdr.send_keys(pane_id, keys)
+        try:
+            text = await self.herdr.read_pane(pane_id, 40)
+            if is_destructive(text):
+                return ("REFUSED: the pending action looks destructive. Read it to "
+                        "the user verbatim and get explicit confirmation, then call "
+                        "send_answer_confirmed.")
+            await self.herdr.send_keys(pane_id, keys)
+        except HerdrError as e:
+            return f"ERROR: {e.code}: {e.message} (pane {pane_id})"
         return "sent"
 
     @function_tool
     async def send_answer_confirmed(self, ctx: RunContext, pane_id: str,
                                     keys: list[str]):
         """Send keys after the user explicitly confirmed a destructive action read to them verbatim."""
-        await self.herdr.send_keys(pane_id, keys)
+        try:
+            await self.herdr.send_keys(pane_id, keys)
+        except HerdrError as e:
+            return f"ERROR: {e.code}: {e.message} (pane {pane_id})"
         return "sent"
 
     @function_tool
     async def tell_agent(self, ctx: RunContext, pane_id: str, text: str):
-        """Send a natural-language instruction to an agent's pane."""
-        await self.herdr.prompt_agent(pane_id, text)
+        """Send a natural-language instruction to a coding agent running in a pane."""
+        try:
+            await self.herdr.prompt_agent(pane_id, text)
+        except HerdrError as e:
+            if e.code == "agent_not_found":
+                return (f"ERROR: no coding agent is registered in pane {pane_id} — "
+                        "it is just a shell. An agent appears only once claude (or "
+                        "another integrated agent) is launched inside a herdr pane. "
+                        "Tell the user that pane has no agent to talk to.")
+            return f"ERROR: {e.code}: {e.message} (pane {pane_id})"
         return "delivered"
 
     @function_tool
     async def spawn_task(self, ctx: RunContext, repo_path: str, branch: str,
                          task: str):
         """Create a worktree in a repo and start a coding agent on a task."""
-        result = await self.herdr.spawn(repo_path, branch, task)
+        try:
+            result = await self.herdr.spawn(repo_path, branch, task)
+        except HerdrError as e:
+            return f"ERROR: {e.code}: {e.message}"
         return json.dumps(result)
 
 
