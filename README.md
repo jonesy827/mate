@@ -40,9 +40,19 @@ messaging and spawns immediate but never skips destructive approvals.
 
 Basic, deliberately. Know what you're deploying:
 
-- The caller allowlist (`MATE_ALLOWED_NUMBERS`, enforced fail-closed in the
-  worker and again on the LiveKit trunk) is the only barrier against
-  hostile callers — and caller ID can be spoofed by a targeted attacker.
+- Two barriers against hostile callers: the caller allowlist
+  (`MATE_ALLOWED_NUMBERS`, enforced fail-closed in the worker and again on
+  the LiveKit trunk) and a spoken four-word passphrase (`MATE_PASSPHRASE`,
+  on by default — caller ID can be spoofed, the passphrase covers that).
+  The passphrase check runs in code on the raw transcript; until it
+  passes, the LLM never runs, every acting tool refuses, and no fleet
+  status is spoken or announced. Three misses hangs up; an attempt spoken
+  for longer than 15 seconds counts as a miss, so one turn can't be
+  stuffed with candidate phrases. There is no default phrase — you pick
+  your own at setup. Three calls in a row ending in a failed-passphrase
+  hangup shuts the whole worker down (the streak survives across calls in
+  a state file; restart the worker to take calls again) — so redialling
+  buys an attacker 9 guesses total, not unlimited.
 - The rail catches bad transcription, not attackers; an attacker says yes
   to their own staged action.
 - An allowed caller drives agents with your full user permissions. The
@@ -77,6 +87,8 @@ Copy `.env.example` to `.env` — it documents every variable.
 | var | purpose |
 |---|---|
 | `MATE_ALLOWED_NUMBERS` | **required**: comma-separated E.164 numbers allowed to call in. Anyone else is hung up on before Mate says a word. |
+| `MATE_PASSPHRASE` | **required** (unless disabled): four words every phone caller must speak before Mate acts. No default — the worker prompts for one at startup if unset. |
+| `MATE_REQUIRE_PASSPHRASE` | default `1`. Set `0` to run without the passphrase gate. |
 | `LIVEKIT_URL` / `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | LiveKit Cloud project |
 | `LLM_URL` `STT_URL` `TTS_URL` | override local endpoints (defaults `:8003` `:8001` `:8880`) |
 | `LLM_MODEL` `STT_MODEL` `TTS_VOICE` | model/voice overrides (default voice `af_heart`) |
@@ -166,6 +178,7 @@ the suite needs no network, herdr, or GPU.
 | `transcripts.py` | per-harness transcript adapters (claude today) |
 | `safety.py` | approval / veto detection for the rail |
 | `allowlist.py` | caller allowlist: normalization + fail-closed matching |
+| `passphrase.py` | spoken-passphrase gate: matching + launch requirement |
 | `scripts/smoke_llm.py` | quick local-LLM sanity check |
 
 ## License
