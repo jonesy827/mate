@@ -192,6 +192,12 @@ Workarounds:
   settled coding agent owns the pane, the message is typed into the pane
   directly. The fallback **never** fires on a bare shell — typed task text
   would execute as a shell command.
+- **Dropped-prompt fallback** (herdr 0.7.5 bug, found live-testing the
+  worktree path): on a worktree-workspace pane, `agent.prompt` answers
+  `agent_prompted` but never types anything. A landed prompt always
+  advances the agent's `state_change_seq`; when it stays frozen after an
+  accepted prompt, the message is typed into the pane directly — same
+  settled-agent guard as above, never into a bare shell.
 - **Enter nudge**: Claude Code's paste guard sometimes swallows the Enter
   herdr sends after typing, leaving the message stuck in the input box.
   Every delivery is followed ~2 s later by one bare Enter — no-op if the

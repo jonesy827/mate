@@ -211,6 +211,7 @@ class ScriptedClient(HerdrClient):
     START_RETRY_DELAY = 0
     PROMPT_RETRY_DELAY = 0
     NUDGE_DELAY = 0
+    PROMPT_VERIFY_WAIT = 0
 
     def __init__(self, script):
         super().__init__("/nonexistent")
@@ -359,10 +360,13 @@ async def test_deliver_task_falls_back_to_pane_input_when_launch_stuck():
     # snapshot proves an idle agent owns the pane, type into it directly.
     not_ready = HerdrError("agent.prompt", "agent_not_ready",
                            "agent w9:p1 is not an active named agent")
+    # two agent.list entries: delivery samples the agent's state once up
+    # front (dropped-prompt detection), then the fallback guard reads it
+    idle = {"agents": [{"pane_id": "w9:p1", "agent": "claude",
+                        "agent_status": "idle"}]}
     c = ScriptedClient({
         "agent.prompt": [not_ready] * (HerdrClient.FALLBACK_AFTER + 1),
-        "agent.list": [{"agents": [{"pane_id": "w9:p1", "agent": "claude",
-                                    "agent_status": "idle"}]}],
+        "agent.list": [idle, idle],
     })
     await c.deliver_task("w9:p1", "do it")
     sends = [p for m, p in c.calls if m == "pane.send_input"]
@@ -383,6 +387,47 @@ async def test_deliver_task_never_types_into_a_bare_shell():
     })
     with pytest.raises(HerdrError):
         await c.deliver_task("w9:p1", "rm -rf importantdir")
+    assert not any(m == "pane.send_input" for m, _ in c.calls)
+
+
+def _listed_agent(status="idle", seq=381):
+    return {"agents": [{"pane_id": "w9:p1", "agent": "claude",
+                        "agent_status": status, "state_change_seq": seq}]}
+
+
+async def test_deliver_task_types_in_when_prompt_silently_dropped():
+    # herdr 0.7.5 bug seen live (worktree-workspace pane): agent.prompt
+    # answers agent_prompted but never types anything — the agent's
+    # state_change_seq stays frozen. Delivery must notice and type directly.
+    c = ScriptedClient({
+        "agent.prompt": [{}],
+        "agent.list": [_listed_agent() for _ in range(10)],
+    })
+    await c.deliver_task("w9:p1", "do it")
+    sends = [p for m, p in c.calls if m == "pane.send_input"]
+    assert sends == [{"pane_id": "w9:p1", "text": "do it",
+                      "keys": ["Enter"]}]
+
+
+async def test_deliver_task_no_fallback_when_prompt_lands():
+    # state_change_seq advanced after the accepted prompt -> it landed;
+    # typing as well would deliver the task twice
+    c = ScriptedClient({
+        "agent.prompt": [{}],
+        "agent.list": [_listed_agent(seq=381), _listed_agent(seq=382)],
+    })
+    await c.deliver_task("w9:p1", "do it")
+    assert not any(m == "pane.send_input" for m, _ in c.calls)
+
+
+async def test_dropped_prompt_fallback_needs_settled_agent():
+    # frozen seq but the agent shows working: it is busy on something else,
+    # so the settled-agent guard must veto typing into its terminal
+    c = ScriptedClient({
+        "agent.prompt": [{}],
+        "agent.list": [_listed_agent(status="working") for _ in range(10)],
+    })
+    await c.deliver_task("w9:p1", "do it")
     assert not any(m == "pane.send_input" for m, _ in c.calls)
 
 
