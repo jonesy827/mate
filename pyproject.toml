@@ -6,10 +6,13 @@ requires-python = ">=3.12"
 dependencies = [
     "livekit-agents[openai,silero]",
     "python-dotenv",
+    # agent.py (endpoint preflight) and notify.py (Telegram) import it
+    # unconditionally -- it is not just a test dependency
+    "httpx",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "pytest-asyncio", "httpx"]
+dev = ["pytest", "pytest-asyncio"]
 
 [build-system]
 requires = ["hatchling"]
