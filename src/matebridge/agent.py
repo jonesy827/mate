@@ -165,7 +165,12 @@ async def entrypoint(ctx: JobContext):
                 "presence_penalty": 0,
             },
         ),
-        tts=openai.TTS(base_url=TTS_URL, api_key="local", model="kokoro",
+        # "tts-1" (not "kokoro"): the plugin treats unknown model names as
+        # OpenAI's SSE-streaming models and parses the response as SSE JSON,
+        # but kokoro returns raw audio bytes -> "no audio frames were pushed".
+        # kokoro-fastapi aliases tts-1 to kokoro, and tts-1 selects the
+        # raw-audio stream path (AUDIO_STREAM_MODELS) in the plugin.
+        tts=openai.TTS(base_url=TTS_URL, api_key="local", model="tts-1",
                        voice=TTS_VOICE),
     )
 
@@ -182,7 +187,11 @@ async def entrypoint(ctx: JobContext):
                                  + json.dumps(data))
 
     watcher = asyncio.create_task(watch_fleet())
-    ctx.add_shutdown_callback(lambda: watcher.cancel())  # type: ignore[arg-type]
+
+    async def _stop_watcher():
+        watcher.cancel()
+
+    ctx.add_shutdown_callback(_stop_watcher)
 
     await session.start(agent=Mate(herdr), room=ctx.room)
     await session.generate_reply(
