@@ -58,18 +58,6 @@ async def test_send_answer_confirmed_bypasses_check():
     assert herdr.sent == [("w1:p1", ["y", "Enter"])]
 
 
-async def test_tell_agent_no_agent_returns_message_not_raise():
-    class NoAgentHerdr(StubHerdr):
-        async def prompt_agent(self, target, text):
-            raise HerdrError("agent.prompt", "agent_not_found",
-                             f"agent target {target} not found")
-
-    mate = Mate(NoAgentHerdr(""))
-    out = await mate.tell_agent(None, pane_id="w1:p1", text="hello?")
-    assert out.startswith("ERROR")
-    assert "no coding agent" in out
-
-
 async def test_herdr_error_becomes_tool_message():
     class BrokenHerdr(StubHerdr):
         async def read_pane(self, pane_id, lines=80, source="recent"):

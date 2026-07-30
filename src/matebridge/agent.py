@@ -31,7 +31,7 @@ from livekit.agents import (
 from livekit.plugins import openai, silero
 
 from .herdr_client import HerdrClient, HerdrError
-from .safety import is_destructive
+from .safety import approves_send, is_destructive
 
 logger = logging.getLogger("matebridge")
 
@@ -77,20 +77,47 @@ def read_transcript_replies(path: Path, count: int) -> list[str]:
     return texts[-count:]
 
 INSTRUCTIONS = """You are Mate, a hands-free voice assistant supervising a fleet of
-coding agents in herdr. The user is often driving. Speak short, natural sentences:
-no markdown, no lists, no code blocks, no emoji. Two to four sentences unless asked.
+coding agents in herdr. The user is often driving and cannot look at a screen.
 
-Always refresh state with tools before reporting status; never answer from memory.
-For "what did the agent say/find/conclude", prefer agent_report (full replies from
-its transcript). Use read_pane for what is on screen now: pending prompts, errors,
-running commands.
-After delegating work with tell_agent or spawn_task, NEVER poll or re-check on
-your own. Quick question: call wait_for_agent once. Anything longer: tell the
-user you'll be notified when it finishes — you will be, automatically.
+Voice output: plain text only — no markdown, lists, code blocks, or emoji. One to
+three short sentences unless asked for more. Vary your acknowledgments; never
+repeat a sentence you already said. When speaking, refer to agents by workspace
+or project name, not pane ids.
+
+Tools are the only source of truth. Refresh with them before reporting status;
+never answer from memory. Never claim an action you did not perform with a tool
+this turn. You cannot cancel, undo, or stop anything already sent — if asked to,
+say so and offer to send the agent a correcting message. If a tool returns
+ERROR, tell the user plainly what failed.
+
+Messaging an agent is a two-step rail. tell_agent and spawn_task only STAGE:
+read the staged message back to the user word for word, ask whether to send it,
+and stop. Only after the user replies, call send_staged. If it returns NOT SENT
+that is normal, not an error — ask explicitly "should I send it?" and call
+send_staged again after they answer. If the user declines, call discard_staged.
+After a message is delivered, NEVER poll or re-check on your own. Quick
+question: call wait_for_agent once. Anything longer: tell the user you'll be
+notified when it finishes — you will be, automatically.
+
+For "what did the agent say/find/conclude", prefer agent_report (full replies
+from its transcript). Use read_pane for what is on screen now: pending prompts,
+errors, running commands.
 Resolve casual project names to workspace labels via fleet_status. If a reference
 is genuinely ambiguous, ask one short question instead of guessing.
 Before approving anything an agent is waiting on, read its pane and tell the user
 exactly what will run if it looks destructive."""
+
+
+def user_transcripts(ctx) -> list[str]:
+    """STT transcripts of the user's turns so far, oldest first, straight from
+    the live session history — not the model's paraphrase of them. Returns []
+    when no session is attached (unit tests pass ctx=None)."""
+    history = getattr(getattr(ctx, "session", None), "history", None)
+    if history is None:
+        return []
+    return [item.text_content or ""
+            for item in getattr(history, "items", [])
+            if getattr(item, "role", None) == "user"]
 
 
 class Mate(Agent):
@@ -100,6 +127,12 @@ class Mate(Agent):
         self._read_panes: set[str] = set()  # rails: read before approve
         # panes given work this call; watch_fleet announces when they finish
         self.delegated: set[str] = set()
+        # stage-and-confirm rail: tell_agent/spawn_task park the exact
+        # payload here; send_staged delivers it only after (a) at least one
+        # new user turn since staging and (b) that turn's raw STT transcript
+        # passes approves_send. The model never re-supplies the text, so what
+        # was read back is byte-for-byte what gets delivered.
+        self._staged: dict | None = None
 
     @function_tool
     async def fleet_status(self, ctx: RunContext):
@@ -220,9 +253,63 @@ class Mate(Agent):
 
     @function_tool
     async def tell_agent(self, ctx: RunContext, pane_id: str, text: str):
-        """Send a natural-language instruction to a coding agent running in a pane."""
+        """Stage a natural-language instruction for a coding agent. Nothing is
+        sent yet: read the staged text back to the user word for word, ask
+        whether to send it, and call send_staged after they reply."""
+        self._staged = {"kind": "tell", "pane_id": pane_id, "text": text,
+                        "turns": len(user_transcripts(ctx))}
+        return (f'staged for pane {pane_id}: "{text}"\n'
+                "NOT SENT YET. Read that back to the user word for word, ask "
+                "whether to send it, and stop. Call send_staged only after "
+                "they reply.")
+
+    @function_tool
+    async def spawn_task(self, ctx: RunContext, repo_path: str, branch: str,
+                         task: str):
+        """Stage a new worktree + coding agent on a task. Nothing is created
+        yet: read the staged task back to the user word for word, ask whether
+        to go ahead, and call send_staged after they reply."""
+        self._staged = {"kind": "spawn", "repo_path": repo_path,
+                        "branch": branch, "task": task,
+                        "turns": len(user_transcripts(ctx))}
+        return (f'staged: new agent in {repo_path} (branch {branch}) with '
+                f'task "{task}"\n'
+                "NOT STARTED YET. Read that back to the user word for word, "
+                "ask whether to go ahead, and stop. Call send_staged only "
+                "after they reply.")
+
+    @function_tool
+    async def send_staged(self, ctx: RunContext):
+        """Deliver the currently staged message or task, exactly as staged.
+        Only call after the user has replied to the read-back."""
+        staged = self._staged
+        if staged is None:
+            return ("ERROR: nothing is staged. Use tell_agent or spawn_task "
+                    "first.")
+        turns = user_transcripts(ctx)
+        if len(turns) <= staged["turns"]:
+            return ("NOT SENT: the user has not replied to the read-back yet. "
+                    "Read the staged message back, ask whether to send it, "
+                    "and call send_staged after they answer.")
+        if not approves_send(turns[-1]):
+            return ("NOT SENT: could not verify a clear yes in the user's "
+                    f'last reply ("{turns[-1]}"). Ask again explicitly — '
+                    '"should I send it?" — wait for the answer, then call '
+                    "send_staged again. If they do not want it sent, call "
+                    "discard_staged.")
+        self._staged = None  # one delivery attempt per confirmation
+        if staged["kind"] == "spawn":
+            try:
+                result = await self.herdr.spawn(
+                    staged["repo_path"], staged["branch"], staged["task"])
+            except HerdrError as e:
+                return f"ERROR: {e.code}: {e.message}"
+            if result.get("pane_id"):
+                self.delegated.add(result["pane_id"])
+            return json.dumps(result)
+        pane_id = staged["pane_id"]
         try:
-            await self.herdr.prompt_agent(pane_id, text)
+            await self.herdr.prompt_agent(pane_id, staged["text"])
         except HerdrError as e:
             if e.code == "agent_not_found":
                 return (f"ERROR: no coding agent is registered in pane {pane_id} — "
@@ -236,16 +323,12 @@ class Mate(Agent):
                 "it finishes — do not check again on your own.")
 
     @function_tool
-    async def spawn_task(self, ctx: RunContext, repo_path: str, branch: str,
-                         task: str):
-        """Create a worktree in a repo and start a coding agent on a task."""
-        try:
-            result = await self.herdr.spawn(repo_path, branch, task)
-        except HerdrError as e:
-            return f"ERROR: {e.code}: {e.message}"
-        if result.get("pane_id"):
-            self.delegated.add(result["pane_id"])
-        return json.dumps(result)
+    async def discard_staged(self, ctx: RunContext):
+        """Drop the staged message without sending it (user said no)."""
+        if self._staged is None:
+            return "nothing was staged."
+        self._staged = None
+        return "discarded — nothing was sent."
 
 
 async def check_endpoints() -> dict[str, str | None]:
@@ -287,10 +370,15 @@ async def entrypoint(ctx: JobContext):
         stt=openai.STT(base_url=STT_URL, api_key="local", model=STT_MODEL),
         llm=openai.LLM(
             base_url=LLM_URL, api_key="local", model=LLM_MODEL,
-            temperature=0.2,
+            # Official qwen rec for non-thinking mode: temp 0.7, top_p 0.8,
+            # top_k 20. At temp 0.2 Mate repeated identical sentences
+            # verbatim in live testing.
+            temperature=0.7,
             extra_body={
                 # llama.cpp: never emit <think> blocks in a voice pipeline
                 "chat_template_kwargs": {"enable_thinking": False},
+                "top_p": 0.8,
+                "top_k": 20,
                 # server default presence_penalty=1.5 breaks tool calling
                 "presence_penalty": 0,
             },

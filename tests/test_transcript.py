@@ -111,12 +111,5 @@ async def test_wait_for_agent_times_out_without_looping(tmp_path, monkeypatch):
     assert "STOP checking" in out
 
 
-async def test_tell_agent_marks_pane_delegated():
-    class OkHerdr(SnapshotHerdr):
-        async def prompt_agent(self, target, text):
-            return {}
-
-    mate = Mate(OkHerdr([]))
-    out = await mate.tell_agent(None, pane_id="w1:p1", text="do stuff")
-    assert out.startswith("delivered")
-    assert "w1:p1" in mate.delegated
+# delegation marking now happens at send_staged delivery time -- covered in
+# tests/test_staging.py (test_clear_yes_delivers_staged_text_verbatim).

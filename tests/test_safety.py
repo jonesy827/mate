@@ -1,4 +1,4 @@
-from matebridge.safety import is_destructive
+from matebridge.safety import approves_send, is_destructive
 
 DESTRUCTIVE_SAMPLES = [
     "git push --force origin main",
@@ -38,3 +38,41 @@ def test_destructive_samples_flagged():
 def test_safe_samples_pass():
     for s in SAFE_SAMPLES:
         assert not is_destructive(s), f"false positive: {s!r}"
+
+
+APPROVALS = [
+    "Yes.",
+    "yeah send it",
+    "Yep, that's correct.",
+    "go ahead",
+    "Do it.",
+    "Send it!",
+    "confirm",
+]
+
+REJECTIONS = [
+    "no",
+    "No, don't send it.",       # contains "send" -- veto must outrank
+    "don't",
+    "Don’t send that",          # curly apostrophe normalization
+    "stop stop stop",
+    "wait",
+    "cancel that",
+    "hold on a second",
+    "actually change the branch name",
+    "that's not right",
+    "hmm let me think",         # no affirmative at all -> block
+    "",                         # empty transcript -> block
+    "redo item three",          # must NOT substring-match "do it"
+    "wait... yes",              # veto outranks affirmative
+]
+
+
+def test_approvals_pass():
+    for s in APPROVALS:
+        assert approves_send(s), f"should approve: {s!r}"
+
+
+def test_rejections_block():
+    for s in REJECTIONS:
+        assert not approves_send(s), f"must block: {s!r}"
