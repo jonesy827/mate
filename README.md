@@ -20,7 +20,7 @@ LiveKit Cloud SIP  (inbound trunk → dispatch rule → room mate-call-<caller>-
    │  WebRTC
    ▼
 mate worker (this repo, runs on the workstation)
-   │  STT ⇄ LLM ⇄ TTS, all local:
+   │  STT ⇄ LLM ⇄ TTS, local by default (LLM can also be the OpenAI API):
    │    :8001 faster-whisper (STT)   :8003 llama.cpp qwen (LLM)   :8880 kokoro (TTS)
    ▼
 herdr unix socket (~/.config/herdr/herdr.sock)
@@ -65,6 +65,7 @@ The short version:
 | `LIVEKIT_URL` / `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | LiveKit Cloud project the worker registers with |
 | `LLM_URL` `STT_URL` `TTS_URL` | override local endpoints (defaults `:8003` `:8001` `:8880`) |
 | `LLM_MODEL` `STT_MODEL` `TTS_VOICE` | model/voice overrides (default voice `af_heart`) |
+| `LLM_API_KEY` | default `local` (no auth, qwen-tuned sampling). Set a real key + `LLM_URL=https://api.openai.com/v1` + an `LLM_MODEL` to run the voice brain on the OpenAI API — usage-billed API key only; a ChatGPT subscription has no API access |
 | `HERDR_SOCKET` | herdr control socket (default `~/.config/herdr/herdr.sock`) |
 | `MATE_SRC_ROOTS` | colon-separated roots `spawn_in_folder` searches (default `~/src`) |
 | `MATE_CLAUDE_PROJECTS` | Claude Code transcript dir (default `~/.claude/projects`) |
@@ -116,6 +117,10 @@ Read this before pointing a phone number at your terminal:
 - A caller who passes the allowlist can drive coding agents that run
   with your user account's full permissions. There is no sandbox beyond
   whatever the agents themselves enforce.
+- **A hosted voice brain ships your data off-box.** With `LLM_API_KEY`
+  set, every transcript, fleet status, and agent reply Mate handles goes
+  to the provider. The default all-local stack keeps calls on your
+  machine (minus ordinary phone carriage).
 
 ## How Mate works
 
