@@ -1,6 +1,8 @@
 """Spoken-passphrase gate: matching, the launch requirement, and the
 code-level lock on the Mate agent (locked turns never reach the LLM)."""
 
+from pathlib import Path
+
 import pytest
 from livekit.agents import StopResponse
 
@@ -8,7 +10,9 @@ from mate.agent import LOCKED_MSG, Mate
 from mate.folders import KnownAgents
 from mate.passphrase import (
     ENABLE_VAR,
+    MAX_FAILED_CALLS,
     PHRASE_VAR,
+    FailedCalls,
     ensure_launch_phrase,
     passphrase_required,
     phrase_heard,
@@ -33,6 +37,14 @@ def test_phrase_heard_rejects_partial_reordered_and_empty():
     assert not phrase_heard("", PHRASE)
     # an unset phrase must never unlock, whatever was said
     assert not phrase_heard("anything at all", "")
+
+
+def test_env_example_ships_no_active_passphrase():
+    # a well-known default phrase would defeat the gate for anyone who
+    # copies .env.example verbatim — the line must stay commented out
+    text = (Path(__file__).parents[1] / ".env.example").read_text()
+    assert not any(line.startswith(f"{PHRASE_VAR}=")
+                   for line in text.splitlines())
 
 
 # --- flag + launch gate ----------------------------------------------------
@@ -69,12 +81,39 @@ def test_launch_gate_prompts_on_tty_until_four_words(monkeypatch):
     assert env[PHRASE_VAR] == PHRASE
 
 
+# --- failed-call streak ----------------------------------------------------
+
+def test_failed_calls_streak_persists_and_resets(tmp_path):
+    # every call runs in its own job process, so the streak must survive
+    # a fresh FailedCalls instance reading the same file
+    path = tmp_path / "failed_calls.json"
+    fc = FailedCalls(path)
+    assert fc.count() == 0
+    assert fc.record_failure() == 1
+    assert FailedCalls(path).count() == 1
+    assert FailedCalls(path).record_failure() == 2
+    assert FailedCalls(path).record_failure() == MAX_FAILED_CALLS
+    fc.reset()
+    assert FailedCalls(path).count() == 0
+
+
+def test_failed_calls_tolerates_missing_or_corrupt_file(tmp_path):
+    path = tmp_path / "failed_calls.json"
+    assert FailedCalls(path).count() == 0  # missing
+    path.write_text("not json")
+    assert FailedCalls(path).count() == 0  # corrupt reads as clean
+    assert FailedCalls(path).record_failure() == 1
+
+
 # --- the lock on Mate ------------------------------------------------------
 
 class Msg:
-    def __init__(self, text):
+    def __init__(self, text, speech_secs=None):
         self.text_content = text
         self.content = [text]
+        self.metrics = ({"started_speaking_at": 100.0,
+                         "stopped_speaking_at": 100.0 + speech_secs}
+                        if speech_secs is not None else {})
 
 
 def make_locked_mate(tmp_path):
@@ -91,24 +130,44 @@ def make_locked_mate(tmp_path):
     async def hangup():
         hung_up.append(True)
 
+    unlocked = []
     mate._speak_confirmation = speak
-    mate.lock(PHRASE, hangup)
-    return mate, spoken, hung_up
+    mate.lock(PHRASE, hangup, on_unlock=lambda: unlocked.append(True))
+    return mate, spoken, hung_up, unlocked
 
 
 @pytest.mark.asyncio
 async def test_correct_phrase_unlocks_and_greets(tmp_path):
-    mate, spoken, hung_up = make_locked_mate(tmp_path)
+    mate, spoken, hung_up, unlocked = make_locked_mate(tmp_path)
     with pytest.raises(StopResponse):
         await mate.on_user_turn_completed(None, Msg("Correct horse, battery staple"))
     assert mate.locked is False
+    assert mate.passphrase_passed is True
+    assert unlocked == [True]
     assert hung_up == []
     assert "What do you need?" in spoken[0]
 
 
 @pytest.mark.asyncio
+async def test_overlong_attempt_is_a_miss_even_with_the_phrase(tmp_path):
+    # 15s max speaking time: one turn can't be stuffed with candidates
+    mate, spoken, hung_up, unlocked = make_locked_mate(tmp_path)
+    with pytest.raises(StopResponse):
+        await mate.on_user_turn_completed(
+            None, Msg(f"one two three {PHRASE} four five", speech_secs=20.0))
+    assert mate.locked is True
+    assert unlocked == []
+    assert "Too long" in spoken[0]
+    # a normal-length correct attempt still unlocks afterwards
+    with pytest.raises(StopResponse):
+        await mate.on_user_turn_completed(None, Msg(PHRASE, speech_secs=4.0))
+    assert mate.locked is False
+    assert hung_up == []
+
+
+@pytest.mark.asyncio
 async def test_wrong_phrase_retries_then_hangs_up(tmp_path):
-    mate, spoken, hung_up = make_locked_mate(tmp_path)
+    mate, spoken, hung_up, _ = make_locked_mate(tmp_path)
     for _ in range(2):
         with pytest.raises(StopResponse):
             await mate.on_user_turn_completed(None, Msg("open the pod bay doors"))
@@ -125,7 +184,7 @@ async def test_wrong_phrase_retries_then_hangs_up(tmp_path):
 
 @pytest.mark.asyncio
 async def test_locked_tools_refuse(tmp_path):
-    mate, _, _ = make_locked_mate(tmp_path)
+    mate, _, _, _ = make_locked_mate(tmp_path)
     assert await mate.tell_agent(None, pane_id="w1:p1", text="hi") == LOCKED_MSG
     assert await mate.spawn_task(None, repo_path="/x", branch="b",
                                  task="t") == LOCKED_MSG
@@ -139,7 +198,7 @@ async def test_locked_tools_refuse(tmp_path):
 
 @pytest.mark.asyncio
 async def test_unlocked_turns_pass_through_to_toggle(tmp_path):
-    mate, _, _ = make_locked_mate(tmp_path)
+    mate, _, _, _ = make_locked_mate(tmp_path)
     with pytest.raises(StopResponse):
         await mate.on_user_turn_completed(None, Msg(PHRASE))
     msg = Msg("guardrails off")
