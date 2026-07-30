@@ -28,6 +28,23 @@ from typing import Any
 DEFAULT_SOCK = Path(os.environ.get(
     "HERDR_SOCKET", Path.home() / ".config/herdr/herdr.sock"))
 
+# The protocol this client's workarounds were verified against. A different
+# herdr is warned about at startup, never refused: the workarounds degrade
+# to no-ops on a herdr that behaves, and real breakage surfaces loudly as
+# HerdrErrors.
+TESTED_PROTOCOL = 17
+
+
+def protocol_note(pong: dict) -> str | None:
+    """None when herdr speaks the tested protocol, else a warning line for
+    the startup log. herdr's ping response carries version + protocol."""
+    proto = pong.get("protocol")
+    if proto == TESTED_PROTOCOL:
+        return None
+    return (f"herdr {pong.get('version', '?')} speaks protocol {proto!r}; "
+            f"the workarounds in herdr_client.py are tuned for protocol "
+            f"{TESTED_PROTOCOL} and may misbehave")
+
 
 class HerdrError(RuntimeError):
     def __init__(self, method: str, code: str, message: str):

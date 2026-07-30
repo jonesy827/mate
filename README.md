@@ -159,7 +159,16 @@ announcement.
 ## herdr integration notes (`herdr_client.py`)
 
 herdr is an external project — mate **never patches it**; everything
-below is a client-side workaround, each pinned by a test:
+below is a client-side workaround, each pinned by a test.
+
+Tested against **herdr 0.7.5 (protocol 17)**. The worker logs herdr's
+version at startup (the preflight ping already carries it) and warns —
+without refusing to run — when the protocol differs: the workarounds
+degrade to no-ops on a herdr that behaves, and real breakage surfaces
+loudly as spoken tool errors, so a hard version gate would only turn
+every herdr upgrade into a refusal to start.
+
+Workarounds:
 
 - **Names are sanitized**: herdr agent names must match
   `^[a-z][a-z0-9_-]{0,31}$`; any folder/branch label is folded to fit

@@ -12,10 +12,12 @@ import json
 import pytest
 
 from matebridge.herdr_client import (
+    TESTED_PROTOCOL,
     HerdrClient,
     HerdrError,
     _find_pane_id,
     _sanitize_agent_name,
+    protocol_note,
 )
 
 pytestmark = pytest.mark.asyncio
@@ -394,3 +396,23 @@ async def test_deliver_task_raises_when_agent_never_ready():
     assert ei.value.code == "agent_not_ready"
     # delivery failure must never tear anything down
     assert not any(m == "workspace.close" for m, _ in c.calls)
+
+
+# --- protocol note (warn-only version check on the preflight pong) -----
+
+async def test_protocol_note_quiet_on_tested_protocol():
+    pong = {"type": "pong", "version": "0.7.5",
+            "protocol": TESTED_PROTOCOL}
+    assert protocol_note(pong) is None
+
+
+async def test_protocol_note_warns_on_other_protocol():
+    note = protocol_note({"type": "pong", "version": "0.9.0",
+                          "protocol": TESTED_PROTOCOL + 1})
+    assert note is not None
+    assert "0.9.0" in note and str(TESTED_PROTOCOL) in note
+
+
+async def test_protocol_note_warns_when_protocol_missing():
+    note = protocol_note({"type": "pong"})
+    assert note is not None and str(TESTED_PROTOCOL) in note

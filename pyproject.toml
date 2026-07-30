@@ -4,15 +4,18 @@ version = "0.1.0"
 description = "Voice bridge: phone-call an assistant that supervises coding agents in herdr"
 requires-python = ">=3.12"
 dependencies = [
-    "livekit-agents[openai,silero]",
-    "python-dotenv",
+    # exact pins: livekit-agents moves fast and this app depends on plugin
+    # internals staying put (the "tts-1" raw-audio alias path, turn_handling
+    # knobs). Bump deliberately, then re-test with a real call.
+    "livekit-agents[openai,silero]==1.6.7",
+    "python-dotenv==1.2.2",
     # agent.py (endpoint preflight) and notify.py (Telegram) import it
     # unconditionally -- it is not just a test dependency
-    "httpx",
+    "httpx==0.28.1",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "pytest-asyncio"]
+dev = ["pytest==9.1.1", "pytest-asyncio==1.4.0"]
 
 [build-system]
 requires = ["hatchling"]
