@@ -45,6 +45,37 @@ def claude_agent(pane_id="w1:p1"):
             "agent_session": {"kind": "id", "value": SESSION}}
 
 
+def codex_agent(pane_id="w1:p1"):
+    # a harness herdr supports but mate has no transcript adapter for
+    return dict(claude_agent(pane_id), agent="codex")
+
+
+# --- adapter registry -------------------------------------------------------
+
+def test_adapter_registry_claude_only():
+    assert transcripts_mod.adapter_for("claude") is not None
+    assert transcripts_mod.adapter_for("codex") is None
+    assert transcripts_mod.adapter_for(None) is None
+    assert transcripts_mod.supported_kinds() == "claude"
+
+
+async def test_agent_report_names_unsupported_harness(tmp_path, monkeypatch):
+    monkeypatch.setattr(transcripts_mod, "CLAUDE_PROJECTS", tmp_path)
+    mate = Mate(SnapshotHerdr([codex_agent()]))
+    out = await mate.agent_report(None, pane_id="w1:p1")
+    assert out.startswith("ERROR")
+    assert "codex" in out and "claude" in out and "read_pane" in out
+
+
+async def test_agent_last_reply_none_for_unsupported_harness(tmp_path,
+                                                             monkeypatch):
+    monkeypatch.setattr(transcripts_mod, "CLAUDE_PROJECTS", tmp_path)
+    write_transcript(tmp_path, ["should never be read"])
+    reply = await transcripts_mod.agent_last_reply(
+        SnapshotHerdr([codex_agent()]), "w1:p1")
+    assert reply is None
+
+
 def test_transcript_path_munges_cwd():
     p = claude_transcript_path(CWD, SESSION)
     assert p.name == f"{SESSION}.jsonl"

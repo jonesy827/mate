@@ -200,6 +200,29 @@ Workarounds:
   framing, etc.) is documented in the module docstring and enforced by
   `tests/test_herdr_client.py`'s fake server.
 
+### Multi-harness support
+
+herdr can host many agent kinds (`claude`, `codex`, `gemini`, `opencode`,
+`amp`, … — `herdr agent start --help` lists them all). Where mate stands:
+
+- **Works with any kind herdr supports**: spawning (`spawn_task` and
+  `spawn_in_folder` take an `agent` kind — "spawn a codex agent in
+  songhaus"), messaging, TUI answers, status watching, and finish
+  announcements — all of it rides on herdr's own abstractions.
+- **Per-harness**: `agent_report` and spoken reply summaries need to read
+  the harness's session transcript, which lives in a different place and
+  format for every harness. Adapters are registered in `transcripts.py`'s
+  `ADAPTERS` — currently **claude only**. Other kinds get a clean "use
+  read_pane instead" answer and generic finish announcements.
+
+Adding a harness is one function: given the agent's cwd and session id
+(herdr reports both), return its last assistant replies. Register it in
+`ADAPTERS` and everything above lights up. Codex is next on the wishlist.
+
+Caveat: `safety.py`'s destructive-prompt heuristic is tuned to Claude
+Code's TUI approval wording — another harness's approval prompt may not
+trip the extra spoken-confirmation rail (see threat model).
+
 ## Development
 
 ```sh
@@ -219,7 +242,7 @@ other files).
 | `agent.py` | the Mate voice agent: tools, rail, watcher, entrypoint |
 | `herdr_client.py` | async herdr socket client + spawn/delivery logic |
 | `folders.py` | folder-name → path resolution for `spawn_in_folder` |
-| `transcripts.py` | reading claude session transcripts for `agent_report` |
+| `transcripts.py` | per-harness transcript adapters for `agent_report` (claude today) |
 | `safety.py` | transcript approval / veto detection for the rail |
 | `allowlist.py` | caller allowlist: normalization + fail-closed matching |
 | `scripts/smoke_llm.py` | quick local-LLM sanity check |

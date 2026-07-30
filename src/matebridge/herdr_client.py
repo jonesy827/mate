@@ -285,9 +285,11 @@ class HerdrClient:
             raise
         return {"workspace": ws, "pane_id": pane_id, "agent_name": name}
 
-    async def spawn(self, repo_path: str, branch: str) -> dict:
-        """Create a worktree workspace in repo_path and start Claude. The
-        task is delivered by the caller via deliver_task() once ready."""
+    async def spawn(self, repo_path: str, branch: str,
+                    agent: str = "claude") -> dict:
+        """Create a worktree workspace in repo_path and start a coding agent
+        (claude by default). The task is delivered by the caller via
+        deliver_task() once ready."""
         wt = await self.call("worktree.create", cwd=repo_path, branch=branch,
                              focus=False)
         # worktree.create response shape is untested ground (needs a git
@@ -295,7 +297,7 @@ class HerdrClient:
         pane_id = _find_pane_id(wt)
         name = None
         if pane_id:
-            name = await self.start_agent(pane_id, branch)
+            name = await self.start_agent(pane_id, branch, kind=agent)
         return {"worktree": wt, "pane_id": pane_id, "agent_name": name}
 
 
