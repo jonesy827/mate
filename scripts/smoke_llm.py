@@ -24,7 +24,7 @@ TOOLS = [{
     },
 }]
 
-FLEET = {"workspaces": [{"label": "matebridge", "id": "w1", "agent_status": "working"},
+FLEET = {"workspaces": [{"label": "mate", "id": "w1", "agent_status": "working"},
                         {"label": "webshop", "id": "w2", "agent_status": "blocked"}],
          "panes": [], "agents": []}
 

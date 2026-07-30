@@ -6,7 +6,7 @@ import asyncio
 
 import pytest
 
-from matebridge.agent import (
+from mate.agent import (
     Delegations,
     Mate,
     detect_rail_toggle,

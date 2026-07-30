@@ -3,8 +3,8 @@ and the worker's refuse-to-start guard."""
 
 import pytest
 
-from matebridge.agent import _require_allowlist
-from matebridge.allowlist import (
+from mate.agent import _require_allowlist
+from mate.allowlist import (
     ENV_VAR,
     allowed_callers,
     is_allowed,
