@@ -20,6 +20,7 @@ import asyncio
 import itertools
 import json
 import os
+import re
 from collections.abc import AsyncIterator, Iterable
 from pathlib import Path
 from typing import Any
@@ -142,18 +143,172 @@ class HerdrClient:
             params["wait"] = wait
         return await self.call("agent.prompt", **params)
 
-    async def spawn(self, repo_path: str, branch: str, task: str) -> dict:
-        """Create a worktree workspace in repo_path and start Claude on task."""
+    # A freshly created pane's shell needs a moment before agent.start
+    # succeeds (herdr: agent_pane_busy "not an available shell"). Verified
+    # live 2026-07-30: immediate agent.start after workspace.create fails.
+    START_RETRIES = 12
+    START_RETRY_DELAY = 0.4
+    # herdr rejects agent.prompt (agent_not_ready) until it *detects* the
+    # launched agent idle — claude's first boot in a folder (trust dialog,
+    # big repo) can take well over a minute, so task delivery must be
+    # patient and must never be treated as a launch failure. timeout_ms
+    # stretches herdr's own managed-launch deadline (default 30s) to match.
+    LAUNCH_TIMEOUT_MS = 120_000
+    PROMPT_RETRIES = 240
+    PROMPT_RETRY_DELAY = 0.5
+    # herdr 0.7.5 bug seen live 2026-07-30: a managed launch can stay
+    # launch_pending forever even though detection reports the agent idle
+    # ("not an active named agent" on every prompt). After this many prompt
+    # attempts, if the snapshot proves the pane hosts a settled agent, type
+    # the message straight into the pane instead of using the gated prompt.
+    FALLBACK_AFTER = 40  # attempts (~20s), rechecked every 10 after that
+    # Claude Code's paste guard sometimes swallows the Enter herdr sends
+    # 300ms after the text, leaving the message stuck in the input box. A
+    # bare Enter shortly after delivery is a no-op if the message went
+    # through and submits it if it didn't.
+    NUDGE_DELAY = 2.0
+
+    async def start_agent(self, pane_id: str, name: str,
+                          kind: str = "claude") -> str:
+        """agent.start with shell-settle retries. The requested name is
+        first folded to herdr's naming rules (seen live 2026-07-30: label
+        "RackCoach" → instant invalid_agent_name). Agent names are unique
+        fleet-wide in herdr, so a taken name gets a numeric suffix. Returns
+        the agent name actually used; raises HerdrError on failure."""
+        base = name = _sanitize_agent_name(name)
+        for attempt in range(self.START_RETRIES):
+            try:
+                await self.call("agent.start", pane_id=pane_id,
+                                name=name, kind=kind,
+                                timeout_ms=self.LAUNCH_TIMEOUT_MS)
+                return name
+            except HerdrError as e:
+                if e.code == "duplicate_agent_name":
+                    suffix = f"-{attempt + 2}"
+                    name = base[:_AGENT_NAME_MAX - len(suffix)] + suffix
+                    continue
+                if (e.code == "agent_pane_busy"
+                        and attempt < self.START_RETRIES - 1):
+                    await asyncio.sleep(self.START_RETRY_DELAY)
+                    continue
+                raise
+        return name
+
+    async def _pane_hosts_settled_agent(self, pane_id: str) -> bool:
+        """True when herdr's detection shows a coding agent sitting idle or
+        blocked in this pane — the precondition for typing a message into
+        the pane directly (never type into a bare shell)."""
+        try:
+            listed = await self.agents()
+        except HerdrError:
+            return False
+        for a in listed.get("agents", []):
+            if (a.get("pane_id") == pane_id and a.get("agent")
+                    and a.get("agent_status") in ("idle", "blocked")):
+                return True
+        return False
+
+    async def nudge_enter(self, pane_id: str) -> None:
+        """One bare Enter, a beat after a delivery — submits a message the
+        paste guard left stuck in the input box, no-op otherwise."""
+        await asyncio.sleep(self.NUDGE_DELAY)
+        try:
+            await self.send_keys(pane_id, ["Enter"])
+        except HerdrError:
+            pass  # the nudge is best-effort; the message itself was sent
+
+    async def deliver_task(self, pane_id: str, task: str) -> None:
+        """Hand a prompt to an agent, retrying through the whole boot window
+        (agent_not_ready until herdr detects the agent idle). If herdr's
+        launch tracking is stuck (launch_pending forever while the agent is
+        visibly idle — seen live on 0.7.5), falls back to typing into the
+        pane once the snapshot proves an agent is settled there. Raises
+        HerdrError if the agent never becomes promptable."""
+        for attempt in range(self.PROMPT_RETRIES):
+            try:
+                await self.prompt_agent(pane_id, task)
+                await self.nudge_enter(pane_id)
+                return
+            except HerdrError as e:
+                if (e.code not in ("agent_not_ready", "agent_not_found")
+                        or attempt >= self.PROMPT_RETRIES - 1):
+                    raise
+                if (attempt >= self.FALLBACK_AFTER
+                        and (attempt - self.FALLBACK_AFTER) % 10 == 0
+                        and await self._pane_hosts_settled_agent(pane_id)):
+                    await self.send_input(pane_id, task)
+                    await self.nudge_enter(pane_id)
+                    return
+                await asyncio.sleep(self.PROMPT_RETRY_DELAY)
+
+    async def spawn_in_folder(self, path: str, label: str,
+                              agent: str = "claude") -> dict:
+        """Open a workspace directly in an existing folder (no worktree) and
+        start a coding agent (claude by default). The agent edits the real
+        working tree. The task is NOT delivered here — the caller hands it
+        over with deliver_task() once the agent finishes booting. Only when
+        agent.start itself fails is the workspace closed again; once the
+        agent is running the workspace is never torn down (a slow boot is
+        not a failed launch)."""
+        ws = await self.call("workspace.create", cwd=path, label=label,
+                             focus=False)
+        pane_id = _find_pane_id(ws)
+        if not pane_id:
+            return {"workspace": ws, "pane_id": None}
+        try:
+            name = await self.start_agent(pane_id, label, kind=agent)
+        except HerdrError:
+            ws_id = _find_workspace_id(ws)
+            if ws_id:
+                try:
+                    await self.call("workspace.close", workspace_id=ws_id,
+                                    force=True)
+                except HerdrError:
+                    pass  # surface the original launch error, not this one
+            raise
+        return {"workspace": ws, "pane_id": pane_id, "agent_name": name}
+
+    async def spawn(self, repo_path: str, branch: str) -> dict:
+        """Create a worktree workspace in repo_path and start Claude. The
+        task is delivered by the caller via deliver_task() once ready."""
         wt = await self.call("worktree.create", cwd=repo_path, branch=branch,
                              focus=False)
         # worktree.create response shape is untested ground (needs a git
         # workspace); find the new workspace's pane defensively.
         pane_id = _find_pane_id(wt)
+        name = None
         if pane_id:
-            await self.call("agent.start", pane_id=pane_id,
-                            name="claude", kind="claude")
-            await self.prompt_agent(pane_id, task)
-        return {"worktree": wt, "pane_id": pane_id}
+            name = await self.start_agent(pane_id, branch)
+        return {"worktree": wt, "pane_id": pane_id, "agent_name": name}
+
+
+_AGENT_NAME_MAX = 32
+
+
+def _sanitize_agent_name(label: str) -> str:
+    """Fold an arbitrary label (folder or branch name) into a valid herdr
+    agent name: ^[a-z][a-z0-9_-]{0,31}$. herdr rejects anything else with
+    invalid_agent_name before even touching the pane."""
+    name = re.sub(r"[^a-z0-9_-]+", "-", label.lower())
+    name = re.sub(r"-+", "-", name).lstrip("0123456789-_").rstrip("-_")
+    if not name:
+        return "agent"
+    return name[:_AGENT_NAME_MAX].rstrip("-_")
+
+
+def _find_workspace_id(obj: Any) -> str | None:
+    """Depth-first hunt for a workspace_id in a response of unknown shape."""
+    if isinstance(obj, dict):
+        if isinstance(obj.get("workspace_id"), str):
+            return obj["workspace_id"]
+        for v in obj.values():
+            if (found := _find_workspace_id(v)) is not None:
+                return found
+    elif isinstance(obj, list):
+        for v in obj:
+            if (found := _find_workspace_id(v)) is not None:
+                return found
+    return None
 
 
 def _find_pane_id(obj: Any) -> str | None:

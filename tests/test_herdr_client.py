@@ -11,7 +11,12 @@ import json
 
 import pytest
 
-from matebridge.herdr_client import HerdrClient, HerdrError, _find_pane_id
+from matebridge.herdr_client import (
+    HerdrClient,
+    HerdrError,
+    _find_pane_id,
+    _sanitize_agent_name,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -195,3 +200,197 @@ async def test_events_pane_scoped_without_pane_id_rejected(fake):
 async def test_find_pane_id():
     assert _find_pane_id({"a": [{"pane": {"pane_id": "w2:p9"}}]}) == "w2:p9"
     assert _find_pane_id({"nothing": [1, "x", None]}) is None
+
+
+class ScriptedClient(HerdrClient):
+    """Overrides call() with a per-method script of results; HerdrError
+    entries are raised. Retry delays zeroed so tests run instantly."""
+
+    START_RETRY_DELAY = 0
+    PROMPT_RETRY_DELAY = 0
+    NUDGE_DELAY = 0
+
+    def __init__(self, script):
+        super().__init__("/nonexistent")
+        self.script = {k: list(v) for k, v in script.items()}
+        self.calls = []
+
+    async def call(self, method, **params):
+        self.calls.append((method, params))
+        queue = self.script.get(method, [])
+        result = queue.pop(0) if queue else {}
+        if isinstance(result, HerdrError):
+            raise result
+        return result
+
+
+def _busy():
+    return HerdrError("agent.start", "agent_pane_busy",
+                      "agent target pane w9:p1 is not an available shell")
+
+
+async def test_spawn_in_folder_retries_until_shell_ready():
+    # the songhaus bug, part 1: agent.start 100ms after workspace.create
+    # fails because the fresh pane has no available shell yet
+    c = ScriptedClient({
+        "workspace.create": [{"workspace_id": "w9", "pane_id": "w9:p1"}],
+        "agent.start": [_busy(), _busy(), {}],
+    })
+    result = await c.spawn_in_folder("/src/songhaus", "songhaus")
+    assert result["pane_id"] == "w9:p1"
+    assert result["agent_name"] == "songhaus"
+    starts = [p for m, p in c.calls if m == "agent.start"]
+    assert len(starts) == 3
+    assert starts[0]["kind"] == "claude"
+    # herdr's managed-launch deadline stretched past its 30s default so a
+    # slow claude boot isn't abandoned server-side either
+    assert starts[0]["timeout_ms"] == HerdrClient.LAUNCH_TIMEOUT_MS
+    assert not any(m == "workspace.close" for m, _ in c.calls)
+    # spawn never prompts: the task is delivered separately once ready
+    assert not any(m == "agent.prompt" for m, _ in c.calls)
+
+
+async def test_spawn_in_folder_unique_name_on_duplicate():
+    c = ScriptedClient({
+        "workspace.create": [{"workspace_id": "w9", "pane_id": "w9:p1"}],
+        "agent.start": [HerdrError("agent.start", "duplicate_agent_name",
+                                   "taken"), {}],
+    })
+    result = await c.spawn_in_folder("/src/songhaus", "songhaus")
+    assert result["agent_name"] == "songhaus-2"
+    starts = [p for m, p in c.calls if m == "agent.start"]
+    assert [s["name"] for s in starts] == ["songhaus", "songhaus-2"]
+
+
+def test_sanitize_agent_name():
+    # herdr requires ^[a-z][a-z0-9_-]{0,31}$ (invalid_agent_name otherwise)
+    assert _sanitize_agent_name("RackCoach") == "rackcoach"
+    assert _sanitize_agent_name("My Repo!") == "my-repo"
+    assert _sanitize_agent_name("Fix/The Thing") == "fix-the-thing"
+    assert _sanitize_agent_name("123abc") == "abc"  # must start with a letter
+    assert _sanitize_agent_name("snake_case_ok") == "snake_case_ok"
+    assert _sanitize_agent_name("!!!") == "agent"
+    assert _sanitize_agent_name("") == "agent"
+    assert _sanitize_agent_name("x" * 50) == "x" * 32
+
+
+async def test_spawn_in_folder_sanitizes_agent_name():
+    # the RackCoach bug: the folder label went to agent.start verbatim and
+    # herdr rejected the capital letters instantly, three calls in a row
+    c = ScriptedClient({
+        "workspace.create": [{"workspace_id": "w9", "pane_id": "w9:p1"}],
+        "agent.start": [{}],
+    })
+    result = await c.spawn_in_folder("/src/RackCoach", "RackCoach")
+    assert result["agent_name"] == "rackcoach"
+    starts = [p for m, p in c.calls if m == "agent.start"]
+    assert starts[0]["name"] == "rackcoach"
+    assert not any(m == "workspace.close" for m, _ in c.calls)
+
+
+async def test_duplicate_suffix_stays_within_name_limit():
+    c = ScriptedClient({
+        "workspace.create": [{"workspace_id": "w9", "pane_id": "w9:p1"}],
+        "agent.start": [HerdrError("agent.start", "duplicate_agent_name",
+                                   "taken"), {}],
+    })
+    result = await c.spawn_in_folder("/src/x", "X" * 40)
+    starts = [p for m, p in c.calls if m == "agent.start"]
+    assert starts[0]["name"] == "x" * 32
+    assert starts[1]["name"] == "x" * 30 + "-2"
+    assert result["agent_name"] == starts[1]["name"]
+
+
+async def test_spawn_in_folder_agent_kind_passes_through():
+    c = ScriptedClient({
+        "workspace.create": [{"workspace_id": "w9", "pane_id": "w9:p1"}],
+        "agent.start": [{}],
+    })
+    await c.spawn_in_folder("/src/x", "x", agent="pi")
+    starts = [p for m, p in c.calls if m == "agent.start"]
+    assert starts[0]["kind"] == "pi"
+
+
+async def test_spawn_in_folder_closes_workspace_on_start_failure():
+    fatal = HerdrError("agent.start", "invalid_agent_name", "bad")
+    c = ScriptedClient({
+        "workspace.create": [{"workspace_id": "w9", "pane_id": "w9:p1"}],
+        "agent.start": [fatal],
+    })
+    with pytest.raises(HerdrError) as ei:
+        await c.spawn_in_folder("/src/x", "x")
+    assert ei.value.code == "invalid_agent_name"
+    closes = [p for m, p in c.calls if m == "workspace.close"]
+    assert closes == [{"workspace_id": "w9", "force": True}]
+
+
+async def test_spawn_in_folder_gives_up_after_persistent_busy():
+    c = ScriptedClient({
+        "workspace.create": [{"workspace_id": "w9", "pane_id": "w9:p1"}],
+        "agent.start": [_busy() for _ in range(HerdrClient.START_RETRIES)],
+    })
+    with pytest.raises(HerdrError) as ei:
+        await c.spawn_in_folder("/src/x", "x")
+    assert ei.value.code == "agent_pane_busy"
+    closes = [m for m, _ in c.calls if m == "workspace.close"]
+    assert closes == ["workspace.close"]
+
+
+async def test_deliver_task_retries_through_boot():
+    # the songhaus bug, part 2: claude's first boot in a folder keeps
+    # agent.prompt at agent_not_ready for a long time — delivery must wait
+    # it out instead of declaring the launch failed
+    not_ready = HerdrError("agent.prompt", "agent_not_ready", "pending")
+    c = ScriptedClient({
+        "agent.prompt": [not_ready] * 30 + [{}],
+    })
+    await c.deliver_task("w9:p1", "do it")
+    assert sum(1 for m, _ in c.calls if m == "agent.prompt") == 31
+    # paste-guard self-heal: one bare Enter follows every delivery
+    keys = [p for m, p in c.calls if m == "pane.send_keys"]
+    assert keys == [{"pane_id": "w9:p1", "keys": ["Enter"]}]
+
+
+async def test_deliver_task_falls_back_to_pane_input_when_launch_stuck():
+    # herdr 0.7.5 bug seen live: launch_pending never clears even though
+    # the agent is detected idle — agent.prompt refuses forever. Once the
+    # snapshot proves an idle agent owns the pane, type into it directly.
+    not_ready = HerdrError("agent.prompt", "agent_not_ready",
+                           "agent w9:p1 is not an active named agent")
+    c = ScriptedClient({
+        "agent.prompt": [not_ready] * (HerdrClient.FALLBACK_AFTER + 1),
+        "agent.list": [{"agents": [{"pane_id": "w9:p1", "agent": "claude",
+                                    "agent_status": "idle"}]}],
+    })
+    await c.deliver_task("w9:p1", "do it")
+    sends = [p for m, p in c.calls if m == "pane.send_input"]
+    assert sends == [{"pane_id": "w9:p1", "text": "do it",
+                      "keys": ["Enter"]}]
+    keys = [m for m, _ in c.calls if m == "pane.send_keys"]
+    assert keys == ["pane.send_keys"]
+
+
+async def test_deliver_task_never_types_into_a_bare_shell():
+    # fallback must not fire when no settled agent owns the pane — typing
+    # a task into a shell would execute it as a command
+    not_ready = HerdrError("agent.prompt", "agent_not_ready", "pending")
+    c = ScriptedClient({
+        "agent.prompt": [not_ready] * HerdrClient.PROMPT_RETRIES,
+        "agent.list": [{"agents": []}
+                       for _ in range(HerdrClient.PROMPT_RETRIES)],
+    })
+    with pytest.raises(HerdrError):
+        await c.deliver_task("w9:p1", "rm -rf importantdir")
+    assert not any(m == "pane.send_input" for m, _ in c.calls)
+
+
+async def test_deliver_task_raises_when_agent_never_ready():
+    c = ScriptedClient({
+        "agent.prompt": [HerdrError("agent.prompt", "agent_not_ready", "x")
+                         for _ in range(HerdrClient.PROMPT_RETRIES)],
+    })
+    with pytest.raises(HerdrError) as ei:
+        await c.deliver_task("w9:p1", "t")
+    assert ei.value.code == "agent_not_ready"
+    # delivery failure must never tear anything down
+    assert not any(m == "workspace.close" for m, _ in c.calls)
