@@ -13,7 +13,8 @@ import os
 import re
 from pathlib import Path
 
-CLAUDE_PROJECTS = Path(os.path.expanduser("~/.claude/projects"))
+CLAUDE_PROJECTS = Path(os.path.expanduser(
+    os.environ.get("MATE_CLAUDE_PROJECTS", "~/.claude/projects")))
 
 
 def claude_transcript_path(cwd: str, session_id: str) -> Path:
@@ -48,7 +49,7 @@ async def agent_last_reply(herdr, pane_id: str, count: int = 1) -> str | None:
     """
     try:
         snap = await herdr.snapshot()
-    except Exception:  # noqa: BLE001 - any herdr trouble means "no excerpt"
+    except Exception:
         return None
     agent = next((a for a in snap.get("agents", [])
                   if a.get("pane_id") == pane_id), None)

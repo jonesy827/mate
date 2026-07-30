@@ -179,7 +179,7 @@ class RecordingHerdr:
         self.deliveries.append((pane_id, task))
 
     async def nudge_enter(self, pane_id):
-        self.nudges = getattr(self, "nudges", []) + [pane_id]
+        self.nudges = [*getattr(self, "nudges", []), pane_id]
 
 
 async def test_toggle_off_flips_flag_and_injects_note():

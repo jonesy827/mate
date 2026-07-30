@@ -12,7 +12,6 @@ from matebridge.allowlist import (
     sip_caller,
 )
 
-
 # --- normalization -----------------------------------------------------
 
 @pytest.mark.parametrize("raw", [
