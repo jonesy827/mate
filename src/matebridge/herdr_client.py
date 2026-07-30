@@ -184,6 +184,12 @@ class HerdrClient:
     # bare Enter shortly after delivery is a no-op if the message went
     # through and submits it if it didn't.
     NUDGE_DELAY = 2.0
+    # herdr 0.7.5 bug seen live (2026-07-30, worktree workspace): agent.prompt
+    # answers agent_prompted but nothing is ever typed into the pane. A landed
+    # prompt always advances the agent's state_change_seq within moments (the
+    # typed text sends claude working); a dropped one leaves it frozen.
+    PROMPT_VERIFY_WAIT = 2.0  # per check, after the nudge
+    PROMPT_VERIFY_CHECKS = 2
 
     async def start_agent(self, pane_id: str, name: str,
                           kind: str = "claude") -> str:
@@ -234,17 +240,57 @@ class HerdrClient:
         except HerdrError:
             pass  # the nudge is best-effort; the message itself was sent
 
+    async def _agent_state_marker(self, pane_id: str) -> tuple | None:
+        """(state_change_seq, agent_status) for the pane's agent, or None
+        when the agent isn't listed or herdr doesn't report the seq (no
+        verification possible then — the dropped-prompt fallback must never
+        fire on doubt alone, it types text into a terminal)."""
+        try:
+            listed = await self.agents()
+        except HerdrError:
+            return None
+        for a in listed.get("agents", []):
+            if a.get("pane_id") == pane_id:
+                seq = a.get("state_change_seq")
+                return None if seq is None else (seq, a.get("agent_status"))
+        return None
+
+    async def _prompt_landed(self, pane_id: str, before: tuple | None) -> bool:
+        """False only when the agent's state provably never moved after an
+        accepted prompt. Unknown/unreadable state counts as landed."""
+        if before is None:
+            return True
+        for _ in range(self.PROMPT_VERIFY_CHECKS):
+            await asyncio.sleep(self.PROMPT_VERIFY_WAIT)
+            now = await self._agent_state_marker(pane_id)
+            if now is None or now != before:
+                return True
+        return False
+
     async def deliver_task(self, pane_id: str, task: str) -> None:
         """Hand a prompt to an agent, retrying through the whole boot window
-        (agent_not_ready until herdr detects the agent idle). If herdr's
-        launch tracking is stuck (launch_pending forever while the agent is
-        visibly idle — seen live on 0.7.5), falls back to typing into the
-        pane once the snapshot proves an agent is settled there. Raises
-        HerdrError if the agent never becomes promptable."""
+        (agent_not_ready until herdr detects the agent idle). Two herdr
+        0.7.5 failure modes are worked around, both seen live:
+
+        - stuck launch tracking (launch_pending forever while the agent is
+          visibly idle — agent.prompt refuses every attempt): after ~20s of
+          refusals, type into the pane once the snapshot proves a settled
+          agent owns it.
+        - silently dropped prompt (worktree-workspace panes: agent.prompt
+          answers agent_prompted but never types anything): if the agent's
+          state_change_seq is still frozen after an accepted prompt, type
+          into the pane — same settled-agent guard, never a bare shell.
+
+        Raises HerdrError if the agent never becomes promptable."""
+        marker = await self._agent_state_marker(pane_id)
         for attempt in range(self.PROMPT_RETRIES):
             try:
                 await self.prompt_agent(pane_id, task)
                 await self.nudge_enter(pane_id)
+                if not await self._prompt_landed(pane_id, marker):
+                    if await self._pane_hosts_settled_agent(pane_id):
+                        await self.send_input(pane_id, task)
+                        await self.nudge_enter(pane_id)
                 return
             except HerdrError as e:
                 if (e.code not in ("agent_not_ready", "agent_not_found")
