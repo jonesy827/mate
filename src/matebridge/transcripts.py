@@ -1,8 +1,19 @@
-"""Reading Claude Code session transcripts for agent_report.
+"""Per-harness transcript adapters for agent_report.
 
-Claude Code writes one JSONL transcript per session under
-~/.claude/projects/<munged-cwd>/<session-id>.jsonl. herdr's integration hook
-reports the session id + cwd, which is enough to find it.
+herdr can host many agent kinds (claude, codex, gemini, ...). Spawning,
+messaging, and status-watching work for all of them through herdr itself,
+but reading an agent's *replies* back means knowing where that harness
+writes its session transcript and how to parse it — which is per-harness
+knowledge. ADAPTERS maps herdr's agent kind to a reader; a kind without an
+entry still runs fine, Mate just falls back to read_pane for its output.
+
+An adapter is `(cwd, session_id, count) -> list[str]`: the last `count`
+assistant replies, newest last. herdr's integration hook reports the
+session id + cwd for detected agents, which is what adapters key on. May
+raise OSError when the transcript file is missing/unreadable.
+
+Claude Code: one JSONL transcript per session under
+~/.claude/projects/<munged-cwd>/<session-id>.jsonl.
 """
 
 from __future__ import annotations
@@ -10,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections.abc import Callable
 from pathlib import Path
 
 CLAUDE_PROJECTS = Path(os.path.expanduser(
@@ -39,12 +51,32 @@ def read_transcript_replies(path: Path, count: int) -> list[str]:
     return texts[-count:]
 
 
+def _claude_replies(cwd: str, session_id: str, count: int) -> list[str]:
+    return read_transcript_replies(
+        claude_transcript_path(cwd, session_id), count)
+
+
+Adapter = Callable[[str, str, int], list[str]]
+
+ADAPTERS: dict[str, Adapter] = {
+    "claude": _claude_replies,
+}
+
+
+def adapter_for(kind: str | None) -> Adapter | None:
+    return ADAPTERS.get(kind or "")
+
+
+def supported_kinds() -> str:
+    return ", ".join(sorted(ADAPTERS))
+
+
 async def agent_last_reply(herdr, pane_id: str, count: int = 1) -> str | None:
-    """Last reply text of the claude agent in pane_id, or None.
+    """Last reply text of the agent in pane_id, or None.
 
     Quiet variant of Mate._agent_replies for callers that want an excerpt
     or nothing (the voice agent keeps its own version with LLM-facing
-    ERROR strings).
+    ERROR strings). None for harnesses without a transcript adapter.
     """
     try:
         snap = await herdr.snapshot()
@@ -52,14 +84,14 @@ async def agent_last_reply(herdr, pane_id: str, count: int = 1) -> str | None:
         return None
     agent = next((a for a in snap.get("agents", [])
                   if a.get("pane_id") == pane_id), None)
-    if agent is None or agent.get("agent") != "claude":
+    if agent is None:
         return None
+    reader = adapter_for(agent.get("agent"))
     session = agent.get("agent_session") or {}
-    if session.get("kind") != "id":
+    if reader is None or session.get("kind") != "id":
         return None
-    path = claude_transcript_path(agent.get("cwd", ""), session["value"])
     try:
-        replies = read_transcript_replies(path, max(1, count))
+        replies = reader(agent.get("cwd", ""), session["value"], max(1, count))
     except OSError:
         return None
     return "\n\n".join(replies) if replies else None

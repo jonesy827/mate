@@ -170,8 +170,8 @@ class RecordingHerdr:
         self.prompts.append((target, text))
         return {}
 
-    async def spawn(self, repo_path, branch):
-        self.spawns.append((repo_path, branch))
+    async def spawn(self, repo_path, branch, agent="claude"):
+        self.spawns.append((repo_path, branch, agent))
         return {"pane_id": "w9:p1", "workspace_id": "w9",
                 "agent_name": branch}
 
@@ -238,7 +238,7 @@ async def test_rails_off_spawn_starts_immediately():
     out = await mate.spawn_task(None, repo_path="/repo", branch="main",
                                 task="fix the tests")
     assert "started immediately" in out
-    assert herdr.spawns == [("/repo", "main")]
+    assert herdr.spawns == [("/repo", "main", "claude")]
     # task lands via the background deliverer; delegated joins on delivery
     while mate._bg:
         await asyncio.gather(*list(mate._bg))

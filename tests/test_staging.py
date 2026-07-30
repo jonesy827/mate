@@ -37,8 +37,8 @@ class RecordingHerdr:
         self.prompts.append((target, text))
         return {}
 
-    async def spawn(self, repo_path, branch):
-        self.spawns.append((repo_path, branch))
+    async def spawn(self, repo_path, branch, agent="claude"):
+        self.spawns.append((repo_path, branch, agent))
         return {"pane_id": "w9:p1", "workspace_id": "w9",
                 "agent_name": branch}
 
@@ -153,11 +153,26 @@ async def test_spawn_task_rail_parallels_tell_agent():
     assert blocked.startswith("NOT SENT")
     sent = await mate.send_staged(FakeCtx(["first", "wait", "go ahead"]))
     assert json.loads(sent)["pane_id"] == "w9:p1"
-    assert herdr.spawns == [("/repo", "main")]
+    assert herdr.spawns == [("/repo", "main", "claude")]
     while mate._bg:
         await asyncio.gather(*list(mate._bg))
     assert herdr.deliveries == [("w9:p1", "fix the tests")]
     assert "w9:p1" in mate.delegated
+
+
+async def test_spawn_task_harness_passthrough():
+    # herdr hosts many agent kinds; the tool passes the (normalized) kind
+    # through and the spoken staging line names non-default harnesses
+    herdr = RecordingHerdr()
+    mate = Mate(herdr)
+    out = await mate.spawn_task(FakeCtx(["first"]), repo_path="/repo",
+                                branch="main", task="t", agent="Codex")
+    assert "a codex agent" in out
+    sent = await mate.send_staged(FakeCtx(["first", "yes"]))
+    assert json.loads(sent)["pane_id"] == "w9:p1"
+    assert herdr.spawns == [("/repo", "main", "codex")]
+    while mate._bg:
+        await asyncio.gather(*list(mate._bg))
 
 
 async def test_tell_agent_queues_message_while_agent_boots():

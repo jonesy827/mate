@@ -36,7 +36,7 @@ from .allowlist import ENV_VAR, allowed_callers, is_allowed, sip_caller
 from .folders import KnownAgents, resolve_folder, speakable_path
 from .herdr_client import HerdrClient, HerdrError, protocol_note
 from .safety import approves_send, is_destructive
-from .transcripts import claude_transcript_path, read_transcript_replies
+from .transcripts import adapter_for, supported_kinds
 
 logger = logging.getLogger("matebridge")
 
@@ -400,7 +400,8 @@ class Mate(Agent):
         return "sent"
 
     async def _agent_replies(self, pane_id: str, messages: int = 1) -> str:
-        """Last replies from the pane's claude transcript, or an ERROR string."""
+        """Last replies from the pane's agent transcript, or an ERROR string.
+        Dispatches on the harness via the transcripts adapter registry."""
         try:
             snap = await self.herdr.snapshot()
         except HerdrError as e:
@@ -410,15 +411,18 @@ class Mate(Agent):
         if agent is None:
             return (f"ERROR: no coding agent is registered in pane {pane_id}. "
                     "Use read_pane to see the raw terminal instead.")
+        kind = agent.get("agent")
+        reader = adapter_for(kind)
         session = agent.get("agent_session") or {}
-        if agent.get("agent") != "claude" or session.get("kind") != "id":
-            return ("ERROR: transcript reading is only wired up for claude "
-                    "agents. Use read_pane instead.")
-        path = claude_transcript_path(agent.get("cwd", ""), session["value"])
+        if reader is None or session.get("kind") != "id":
+            return (f"ERROR: no transcript adapter for {kind} agents "
+                    f"(adapters exist for: {supported_kinds()}). "
+                    "Use read_pane instead.")
         try:
-            replies = read_transcript_replies(path, max(1, min(messages, 10)))
+            replies = reader(agent.get("cwd", ""), session["value"],
+                             max(1, min(messages, 10)))
         except OSError:
-            return (f"ERROR: transcript not readable at {path}. "
+            return (f"ERROR: the {kind} transcript is not readable. "
                     "Use read_pane instead.")
         if not replies:
             return "The agent has not written any replies yet this session."
@@ -544,7 +548,8 @@ class Mate(Agent):
         if staged["kind"] == "spawn":
             try:
                 result = await self.herdr.spawn(
-                    staged["repo_path"], staged["branch"])
+                    staged["repo_path"], staged["branch"],
+                    agent=staged.get("agent", "claude"))
             except HerdrError as e:
                 return f"ERROR: {e.code}: {e.message}"
             self._deliver_task_in_background(
@@ -614,24 +619,28 @@ class Mate(Agent):
 
     @function_tool
     async def spawn_task(self, ctx: RunContext, repo_path: str, branch: str,
-                         task: str):
-        """Stage a new worktree + coding agent on a task. With guardrails on
-        (default) nothing is created yet: read the staged task back to the
+                         task: str, agent: str = "claude"):
+        """Stage a new worktree + coding agent on a task. Leave agent as
+        "claude" unless the user names a different harness. With guardrails
+        on (default) nothing is created yet: read the staged task back to the
         user word for word, ask whether to go ahead, and call send_staged
         after they reply. With guardrails off it starts immediately."""
+        agent = agent.strip().lower() or "claude"
+        agent_phrase = ("a new agent" if agent == "claude"
+                        else f"a {agent} agent")
         if not self.rail_enabled:
             self._staged = None
             result = await self._deliver(
                 {"kind": "spawn", "repo_path": repo_path, "branch": branch,
-                 "task": task})
+                 "task": task, "agent": agent})
             if result.startswith("ERROR"):
                 return result
             return ("guardrails off — task started immediately.\n" + result)
         self._staged = {"kind": "spawn", "repo_path": repo_path,
-                        "branch": branch, "task": task,
+                        "branch": branch, "task": task, "agent": agent,
                         "turns": len(user_transcripts(ctx))}
-        return (f'staged: new agent in {repo_path} (branch {branch}) with '
-                f'task "{task}"\n'
+        return (f'staged: {agent_phrase} in {repo_path} (branch {branch}) '
+                f'with task "{task}"\n'
                 "NOT STARTED YET. Read that back to the user word for word, "
                 "ask whether to go ahead, and stop. Call send_staged only "
                 "after they reply.")
