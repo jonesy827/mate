@@ -4,9 +4,9 @@ import json
 
 import pytest
 
-import matebridge.transcripts as transcripts_mod
-from matebridge.agent import Mate
-from matebridge.transcripts import claude_transcript_path, read_transcript_replies
+import mate.transcripts as transcripts_mod
+from mate.agent import Mate
+from mate.transcripts import claude_transcript_path, read_transcript_replies
 
 pytestmark = pytest.mark.asyncio
 

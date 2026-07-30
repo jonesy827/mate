@@ -3,7 +3,7 @@ qwen-tuned sampling block; a real API key (hosted provider) must NOT send
 it — api.openai.com 400s on top_k, and gpt-5-era models reject any
 non-default temperature."""
 
-from matebridge import agent
+from mate import agent
 
 
 def test_local_default_gets_qwen_sampling(monkeypatch):

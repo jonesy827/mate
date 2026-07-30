@@ -15,12 +15,12 @@ import time
 from pathlib import Path
 
 SRC_ROOTS_ENV = "MATE_SRC_ROOTS"  # colon-separated, default ~/src
-KNOWN_AGENTS_PATH = "~/.config/matebridge/known_agents.json"
+KNOWN_AGENTS_PATH = "~/.config/mate/known_agents.json"
 
 
 def squash(name: str) -> str:
     """Normalize a spoken or filesystem name for matching: lowercase, letters
-    and digits only. "Mate Bridge" == "matebridge" == "mate-bridge"."""
+    and digits only. "Song Haus" == "songhaus" == "song-haus"."""
     return re.sub(r"[^a-z0-9]", "", name.lower())
 
 
@@ -51,7 +51,7 @@ def resolve_folder(spoken: str, roots: list[Path] | None = None) -> list[Path]:
 
 def speakable_path(path: Path | str) -> str:
     """Path rendered for TTS: components spoken in order, no slashes.
-    /home/jonesy/src/matebridge -> "home, jonesy, src, matebridge"."""
+    /home/jonesy/src/mate -> "home, jonesy, src, mate"."""
     parts = [p for p in Path(path).parts if p != "/"]
     return ", ".join(parts)
 

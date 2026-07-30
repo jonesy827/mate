@@ -1,8 +1,8 @@
 """Mate — LiveKit Agents worker bridging voice to a herdr fleet.
 
-Run:  python -m matebridge.agent console   # terminal mic/speaker desk test
-      python -m matebridge.agent dev       # worker + Agents Playground
-      python -m matebridge.agent start     # production (SIP calls dispatch here)
+Run:  python -m mate.agent console   # terminal mic/speaker desk test
+      python -m mate.agent dev       # worker + Agents Playground
+      python -m mate.agent start     # production (SIP calls dispatch here)
 
 Local services expected:
   :8003  llama.cpp qwen3.6-35b-a3b (thinking disabled via chat_template_kwargs)
@@ -38,7 +38,7 @@ from .herdr_client import HerdrClient, HerdrError, protocol_note
 from .safety import approves_send, is_destructive
 from .transcripts import adapter_for, supported_kinds
 
-logger = logging.getLogger("matebridge")
+logger = logging.getLogger("mate")
 
 LLM_URL = os.environ.get("LLM_URL", "http://localhost:8003/v1")
 STT_URL = os.environ.get("STT_URL", "http://localhost:8001/v1")
@@ -800,7 +800,7 @@ async def entrypoint(ctx: JobContext):
     if down:
         details = "\n".join(f"  {k}: {v}" for k, v in down.items())
         raise RuntimeError(
-            f"matebridge cannot start; unreachable services:\n{details}\n"
+            f"mate cannot start; unreachable services:\n{details}\n"
             f"(llm={LLM_URL} stt={STT_URL} tts={TTS_URL} "
             f"herdr={HerdrClient().sock_path})")
 

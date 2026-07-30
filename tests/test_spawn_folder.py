@@ -6,8 +6,8 @@ import json
 
 import pytest
 
-from matebridge.agent import Mate
-from matebridge.folders import (
+from mate.agent import Mate
+from mate.folders import (
     KnownAgents,
     resolve_folder,
     speakable_path,
@@ -62,18 +62,18 @@ def make_mate(tmp_path, *dirnames):
 # --- resolver --------------------------------------------------------------
 
 def test_resolver_exact_squashed_match(tmp_path):
-    roots = make_roots(tmp_path, "matebridge", "herdr")
-    assert [p.name for p in resolve_folder("mate bridge", roots)] == ["matebridge"]
-    assert [p.name for p in resolve_folder("Mate-Bridge", roots)] == ["matebridge"]
+    roots = make_roots(tmp_path, "songhaus", "herdr")
+    assert [p.name for p in resolve_folder("song haus", roots)] == ["songhaus"]
+    assert [p.name for p in resolve_folder("Song-Haus", roots)] == ["songhaus"]
 
 
 def test_resolver_close_match_catches_stt_spellings(tmp_path):
-    roots = make_roots(tmp_path, "matebridge", "herdr")
+    roots = make_roots(tmp_path, "mate", "herdr")
     assert [p.name for p in resolve_folder("herder", roots)] == ["herdr"]
 
 
 def test_resolver_no_match_and_hidden_dirs_skipped(tmp_path):
-    roots = make_roots(tmp_path, "matebridge")
+    roots = make_roots(tmp_path, "mate")
     (roots[0] / ".git").mkdir()
     assert resolve_folder("frobnicator", roots) == []
     assert resolve_folder("git", roots) == []
@@ -81,8 +81,8 @@ def test_resolver_no_match_and_hidden_dirs_skipped(tmp_path):
 
 
 def test_speakable_path():
-    assert speakable_path("/home/jonesy/src/matebridge") == \
-        "home, jonesy, src, matebridge"
+    assert speakable_path("/home/jonesy/src/mate") == \
+        "home, jonesy, src, mate"
 
 
 # --- KnownAgents memory ----------------------------------------------------
@@ -90,19 +90,19 @@ def test_speakable_path():
 def test_memory_remember_get_forget_persists(tmp_path):
     f = tmp_path / "known.json"
     k = KnownAgents(f)
-    k.remember("matebridge", "/home/jonesy/src/matebridge")
+    k.remember("songhaus", "/home/jonesy/src/songhaus")
     # squash-matched lookup: spoken spelling need not match stored spelling
-    assert KnownAgents(f).get("Mate Bridge") == "/home/jonesy/src/matebridge"
+    assert KnownAgents(f).get("Song Haus") == "/home/jonesy/src/songhaus"
     k2 = KnownAgents(f)
-    assert k2.forget("mate-bridge") is True
-    assert KnownAgents(f).get("matebridge") is None
-    assert k2.forget("matebridge") is False
+    assert k2.forget("song-haus") is True
+    assert KnownAgents(f).get("songhaus") is None
+    assert k2.forget("songhaus") is False
 
 
 def test_memory_names_ordering_and_dedup(tmp_path):
     k = KnownAgents(tmp_path / "known.json")
     k.remember("herdr", "/a")
-    k.remember("matebridge", "/b")
+    k.remember("mate", "/b")
     k.remember("Herdr", "/c")  # same squashed name replaces the old entry
     names = k.names()
     assert names[0] == ("Herdr", "/c")
@@ -118,13 +118,13 @@ def test_memory_survives_corrupt_file(tmp_path):
 # --- spawn_in_folder tool --------------------------------------------------
 
 async def test_unknown_folder_gets_full_path_confirmation(tmp_path):
-    mate, herdr = make_mate(tmp_path, "matebridge")
-    out = await mate.spawn_in_folder(FakeCtx(["spawn one in matebridge"]),
-                                     folder_name="mate bridge",
+    mate, herdr = make_mate(tmp_path, "songhaus")
+    out = await mate.spawn_in_folder(FakeCtx(["spawn one in songhaus"]),
+                                     folder_name="song haus",
                                      task="fix the tests")
     # no live session in tests -> falls back to read-exactly, sentence intact
     assert "Read this to the user EXACTLY" in out
-    assert "full path" in out and "src, matebridge" in out
+    assert "full path" in out and "src, songhaus" in out
     assert "fix the tests" in out
     assert herdr.folder_spawns == []
 
@@ -136,17 +136,17 @@ async def drain_bg(mate):
 
 
 async def test_confirmed_spawn_delivers_and_remembers(tmp_path):
-    mate, herdr = make_mate(tmp_path, "matebridge")
-    await mate.spawn_in_folder(FakeCtx(["first"]), folder_name="matebridge",
+    mate, herdr = make_mate(tmp_path, "mate")
+    await mate.spawn_in_folder(FakeCtx(["first"]), folder_name="mate",
                                task="fix the tests")
     sent = await mate.send_staged(FakeCtx(["first", "yes go ahead"]))
     result = json.loads(sent)
     assert result["pane_id"] == "w5:p1"
     assert len(herdr.folder_spawns) == 1
     path, label, agent = herdr.folder_spawns[0]
-    assert path.endswith("src/matebridge") and label == "matebridge"
+    assert path.endswith("src/mate") and label == "mate"
     assert agent == "claude"
-    assert mate.known.get("matebridge") == path
+    assert mate.known.get("mate") == path
     # the task is handed over in the background once claude boots; the pane
     # joins delegated only after it actually lands
     assert "w5:p1" not in mate.delegated
@@ -159,8 +159,8 @@ async def test_spawn_without_task_skips_delivery(tmp_path):
     # "open up a new agent in songhaus" with no task: herdr rejects empty
     # prompts (empty_agent_prompt), so nothing must be delivered — the agent
     # just opens ready. No delegated entry either: nothing to finish.
-    mate, herdr = make_mate(tmp_path, "matebridge")
-    out = await mate.spawn_in_folder(FakeCtx(["x"]), folder_name="matebridge",
+    mate, herdr = make_mate(tmp_path, "mate")
+    out = await mate.spawn_in_folder(FakeCtx(["x"]), folder_name="mate",
                                      task="")
     assert "no task yet" in out
     sent = await mate.send_staged(FakeCtx(["x", "yes"]))
@@ -173,10 +173,10 @@ async def test_spawn_without_task_skips_delivery(tmp_path):
 
 async def test_failed_background_delivery_keeps_workspace_out_of_delegated(
         tmp_path):
-    from matebridge.herdr_client import HerdrError
-    mate, herdr = make_mate(tmp_path, "matebridge")
+    from mate.herdr_client import HerdrError
+    mate, herdr = make_mate(tmp_path, "mate")
     herdr.deliver_error = HerdrError("agent.prompt", "agent_not_ready", "x")
-    await mate.spawn_in_folder(FakeCtx(["x"]), folder_name="matebridge",
+    await mate.spawn_in_folder(FakeCtx(["x"]), folder_name="mate",
                                task="t")
     await mate.send_staged(FakeCtx(["x", "yes"]))
     await drain_bg(mate)
@@ -185,11 +185,11 @@ async def test_failed_background_delivery_keeps_workspace_out_of_delegated(
 
 
 async def test_known_folder_gets_short_confirmation(tmp_path):
-    mate, herdr = make_mate(tmp_path, "matebridge")
-    real = str(tmp_path / "src" / "matebridge")
-    mate.known.remember("matebridge", real)
+    mate, herdr = make_mate(tmp_path, "mate")
+    real = str(tmp_path / "src" / "mate")
+    mate.known.remember("mate", real)
     out = await mate.spawn_in_folder(FakeCtx(["again"]),
-                                     folder_name="matebridge",
+                                     folder_name="mate",
                                      task="more tests")
     assert "go ahead?" in out
     assert "full path" not in out  # short form, no path readback
@@ -200,42 +200,42 @@ async def test_known_folder_gets_short_confirmation(tmp_path):
 
 
 async def test_stale_memory_falls_back_to_full_confirmation(tmp_path):
-    mate, _herdr = make_mate(tmp_path, "matebridge")
-    mate.known.remember("matebridge", str(tmp_path / "gone"))
-    out = await mate.spawn_in_folder(FakeCtx(["x"]), folder_name="matebridge",
+    mate, _herdr = make_mate(tmp_path, "mate")
+    mate.known.remember("mate", str(tmp_path / "gone"))
+    out = await mate.spawn_in_folder(FakeCtx(["x"]), folder_name="mate",
                                      task="t")
     assert "no longer exists" in out
     assert "full path" in out
 
 
 async def test_no_match_errors_and_ambiguity_asks(tmp_path):
-    mate, _ = make_mate(tmp_path, "matebridge", "mate-bridge-two")
+    mate, _ = make_mate(tmp_path, "mate", "mate-bridge-two")
     out = await mate.spawn_in_folder(FakeCtx(["x"]), folder_name="zzz",
                                      task="t")
     assert out.startswith("ERROR")
-    # both dirs squash-match closely on "matebridge two"-ish input? exact
+    # both dirs squash-match closely on "mate two"-ish input? exact
     # match still wins for the exact name
     exact = await mate.spawn_in_folder(FakeCtx(["x"]),
-                                       folder_name="matebridge", task="t")
+                                       folder_name="mate", task="t")
     assert "EXACTLY" in exact
 
 
 async def test_rails_off_spawns_immediately_and_remembers(tmp_path):
-    mate, herdr = make_mate(tmp_path, "matebridge")
+    mate, herdr = make_mate(tmp_path, "songhaus")
     mate.rail_enabled = False
     out = await mate.spawn_in_folder(FakeCtx(["x"]),
-                                     folder_name="mate bridge", task="t")
+                                     folder_name="song haus", task="t")
     assert "guardrails off" in out and "started immediately" in out
     assert len(herdr.folder_spawns) == 1
-    assert mate.known.get("matebridge") == herdr.folder_spawns[0][0]
+    assert mate.known.get("songhaus") == herdr.folder_spawns[0][0]
     await drain_bg(mate)
     assert herdr.deliveries == [("w5:p1", "t")]
     assert "w5:p1" in mate.delegated
 
 
 async def test_non_default_agent_kind_passes_through(tmp_path):
-    mate, herdr = make_mate(tmp_path, "matebridge")
-    out = await mate.spawn_in_folder(FakeCtx(["x"]), folder_name="matebridge",
+    mate, herdr = make_mate(tmp_path, "mate")
+    out = await mate.spawn_in_folder(FakeCtx(["x"]), folder_name="mate",
                                      task="t", agent="Pi")
     assert "a pi agent" in out  # spoken confirmation names the harness
     sent = await mate.send_staged(FakeCtx(["x", "yes"]))
@@ -247,8 +247,8 @@ async def test_non_default_agent_kind_passes_through(tmp_path):
 async def test_list_and_forget_tools(tmp_path):
     mate, _ = make_mate(tmp_path)
     assert "no known agents" in await mate.list_known_agents(None)
-    mate.known.remember("matebridge", "/x")
+    mate.known.remember("songhaus", "/x")
     listed = json.loads(await mate.list_known_agents(None))
-    assert listed == [{"name": "matebridge", "path": "/x"}]
-    assert "forgotten" in await mate.forget_agent(None, name="mate bridge")
-    assert "ERROR" in await mate.forget_agent(None, name="matebridge")
+    assert listed == [{"name": "songhaus", "path": "/x"}]
+    assert "forgotten" in await mate.forget_agent(None, name="song haus")
+    assert "ERROR" in await mate.forget_agent(None, name="songhaus")

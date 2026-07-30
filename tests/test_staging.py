@@ -6,8 +6,8 @@ import json
 
 import pytest
 
-from matebridge.agent import Mate
-from matebridge.herdr_client import HerdrError
+from mate.agent import Mate
+from mate.herdr_client import HerdrError
 
 pytestmark = pytest.mark.asyncio
 

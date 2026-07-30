@@ -1,4 +1,4 @@
-from matebridge.safety import approves_send, is_destructive
+from mate.safety import approves_send, is_destructive
 
 DESTRUCTIVE_SAMPLES = [
     "git push --force origin main",

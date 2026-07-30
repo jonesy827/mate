@@ -1,5 +1,5 @@
 """HerdrClient tests against a fake server that enforces the REAL protocol
-semantics established in matebridge-groundtruth/REPORT.md:
+semantics established in mate-groundtruth/REPORT.md:
 
 - one request per connection (respond once, then close)
 - unknown method: close without any reply
@@ -11,7 +11,7 @@ import json
 
 import pytest
 
-from matebridge.herdr_client import (
+from mate.herdr_client import (
     TESTED_PROTOCOL,
     HerdrClient,
     HerdrError,

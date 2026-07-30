@@ -3,7 +3,7 @@
 Wire format: newline-delimited JSON over a Unix socket.
 Requests:  {"id": "<string>", "method": "pane.read", "params": {...}}
 
-Ground-truth protocol rules (verified; see matebridge-groundtruth/REPORT.md):
+Ground-truth protocol rules (verified; see mate-groundtruth/REPORT.md):
 - ONE request per connection: the server sends one response line, then
   closes. Pipelining or reusing a connection gets ECONNRESET/EPIPE.
 - events.subscribe is the exception: that connection stays open and streams

@@ -7,9 +7,7 @@ over a real phone call.
 
 This repo is a **reference implementation**: the as-deployed source of one
 working personal system, MIT-licensed so you can lift whatever is useful.
-Expect to read and adapt, not `pip install`. (The Python package is still
-named `matebridge`, so commands and module paths below say `matebridge` —
-that's the import name, not the project name.)
+Expect to read and adapt, not `pip install`.
 
 ## The part worth stealing: a code-enforced confirmation rail
 
@@ -66,9 +64,9 @@ started by hand (`systemctl --user start llama-qwen-long`), and herdr
 running (`tmux new-session -d -s herdr-host herdr`).
 
 ```sh
-.venv/bin/python -m matebridge.agent console   # desk test: terminal mic/speaker
+.venv/bin/python -m mate.agent console   # desk test: terminal mic/speaker
 set -a && source .env && set +a
-.venv/bin/python -m matebridge.agent dev       # real worker: registers with LiveKit
+.venv/bin/python -m mate.agent dev       # real worker: registers with LiveKit
 ```
 
 The worker preflights llm/stt/tts/herdr and refuses to start with a clear
@@ -153,7 +151,7 @@ Read this before pointing a phone number at your terminal:
 
 ## How Mate works
 
-`src/matebridge/agent.py` defines the `Mate` agent and its tools:
+`src/mate/agent.py` defines the `Mate` agent and its tools:
 
 - **Fleet**: `fleet_status`, `read_pane`, `agent_report` (reads the agent's
   actual replies from its session transcript), `wait_for_agent`,

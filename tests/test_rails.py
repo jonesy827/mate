@@ -4,8 +4,8 @@ there is no confirmed-bypass tool, and "guardrails off" does not apply."""
 
 import pytest
 
-from matebridge.agent import Mate
-from matebridge.herdr_client import HerdrError
+from mate.agent import Mate
+from mate.herdr_client import HerdrError
 from test_staging import FakeCtx
 
 pytestmark = pytest.mark.asyncio
