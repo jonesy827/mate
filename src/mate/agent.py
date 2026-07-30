@@ -26,6 +26,7 @@ from livekit.agents import (
     AgentSession,
     JobContext,
     RunContext,
+    StopResponse,
     WorkerOptions,
     cli,
     function_tool,
@@ -35,6 +36,13 @@ from livekit.plugins import openai, silero
 from .allowlist import ENV_VAR, allowed_callers, is_allowed, sip_caller
 from .folders import KnownAgents, resolve_folder, speakable_path
 from .herdr_client import HerdrClient, HerdrError, protocol_note
+from .passphrase import (
+    PHRASE_VAR,
+    configured_phrase,
+    ensure_launch_phrase,
+    passphrase_required,
+    phrase_heard,
+)
 from .safety import approves_send, is_destructive
 from .transcripts import adapter_for, supported_kinds
 
@@ -259,6 +267,16 @@ class Delegations:
         return iter(self._panes)
 
 
+async def fleet_greeting(herdr) -> str:
+    """Spoken fleet-size line for greetings: "3 agents running"."""
+    try:
+        snap = await herdr.snapshot()
+        n = len(snap.get("agents", []))
+        return f"{n} agent{'s' if n != 1 else ''} running"
+    except Exception:
+        return "your fleet is up"
+
+
 def user_transcripts(ctx) -> list[str]:
     """STT transcripts of the user's turns so far, oldest first, straight from
     the live session history — not the model's paraphrase of them. Returns []
@@ -271,7 +289,12 @@ def user_transcripts(ctx) -> list[str]:
             if getattr(item, "role", None) == "user"]
 
 
+LOCKED_MSG = "REFUSED: the caller has not said the passphrase."
+
+
 class Mate(Agent):
+    MAX_PASSPHRASE_ATTEMPTS = 3
+
     def __init__(self, herdr: HerdrClient, known: KnownAgents | None = None,
                  roots: list | None = None):
         super().__init__(instructions=INSTRUCTIONS)
@@ -297,12 +320,56 @@ class Mate(Agent):
         # passes approves_send. The model never re-supplies the text, so what
         # was read back is byte-for-byte what gets delivered.
         self._staged: dict | None = None
+        # spoken-passphrase gate (lock()): while locked, every user turn is
+        # intercepted in code and never reaches the LLM, so no tool can fire
+        self.locked = False
+        self._passphrase = ""
+        self._attempts = 0
+        self._hangup = None
+
+    def lock(self, phrase: str, hangup=None) -> None:
+        """Arm the spoken-passphrase gate. Until the caller says `phrase`,
+        on_user_turn_completed answers every turn itself (retry prompts and
+        all) and raises StopResponse so the LLM never runs. `hangup` is
+        awaited after MAX_PASSPHRASE_ATTEMPTS failures."""
+        self.locked = True
+        self._passphrase = phrase
+        self._hangup = hangup
+        self._attempts = 0
+
+    async def _check_passphrase(self, transcript: str) -> None:
+        if phrase_heard(transcript, self._passphrase):
+            self.locked = False
+            logger.info("passphrase accepted")
+            await self._speak_confirmation(
+                f"That's it, mate. {await fleet_greeting(self.herdr)}. "
+                "What do you need?")
+            return
+        # count only — logging the transcript would leak near-misses
+        self._attempts += 1
+        logger.warning("passphrase attempt %d/%d failed",
+                       self._attempts, self.MAX_PASSPHRASE_ATTEMPTS)
+        if self._attempts >= self.MAX_PASSPHRASE_ATTEMPTS:
+            await self._speak_confirmation(
+                "Sorry mate, that's not it. Goodbye.")
+            if self._hangup is not None:
+                await self._hangup()
+            return
+        await self._speak_confirmation(
+            "That's not it. What's the passphrase?")
 
     async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
-        """Code-level intercept on every finalized user transcript: detect the
-        guardrail toggle phrase, flip the flag here (the model is never asked
-        to), and inject the state change into this message so the LLM knows
-        from this turn onward — the note persists in chat history."""
+        """Code-level intercept on every finalized user transcript. While the
+        passphrase gate is locked the turn stops here: verification, retry
+        prompts and the hangup are all code, and StopResponse keeps the LLM
+        out of the loop entirely. Once unlocked, the only intercept is the
+        guardrail toggle phrase: detect it, flip the flag here (the model is
+        never asked to), and inject the state change into this message so
+        the LLM knows from this turn onward — the note persists in chat
+        history."""
+        if self.locked:
+            await self._check_passphrase(new_message.text_content or "")
+            raise StopResponse()
         toggle = detect_rail_toggle(new_message.text_content or "")
         if toggle is None:
             return
@@ -376,6 +443,8 @@ class Mate(Agent):
         sent: the keys are staged — read the on-screen action to the user
         verbatim, ask whether to approve it, and call send_staged after they
         reply."""
+        if self.locked:
+            return LOCKED_MSG
         if pane_id not in self._read_panes:
             return ("REFUSED: read the pane first so the user knows what "
                     "they are approving.")
@@ -602,6 +671,8 @@ class Mate(Agent):
         to the user word for word, ask whether to send it, and call
         send_staged after they reply. With guardrails off it is delivered
         immediately."""
+        if self.locked:
+            return LOCKED_MSG
         if not self.rail_enabled:
             self._staged = None
             result = await self._deliver(
@@ -625,6 +696,8 @@ class Mate(Agent):
         on (default) nothing is created yet: read the staged task back to the
         user word for word, ask whether to go ahead, and call send_staged
         after they reply. With guardrails off it starts immediately."""
+        if self.locked:
+            return LOCKED_MSG
         agent = agent.strip().lower() or "claude"
         agent_phrase = ("a new agent" if agent == "claude"
                         else f"a {agent} agent")
@@ -657,6 +730,8 @@ class Mate(Agent):
         not invent a task. After calling this, do not read anything back —
         wait for the user's answer, then call send_staged (yes) or
         discard_staged (no)."""
+        if self.locked:
+            return LOCKED_MSG
         agent = agent.strip().lower() or "claude"
         # spoken confirmations name the harness only when it isn't the default
         agent_phrase = "a new agent" if agent == "claude" else f"a {agent} agent"
@@ -732,6 +807,8 @@ class Mate(Agent):
     async def send_staged(self, ctx: RunContext):
         """Deliver the currently staged message or task, exactly as staged.
         Only call after the user has replied to the read-back."""
+        if self.locked:
+            return LOCKED_MSG
         staged = self._staged
         if staged is None:
             return ("ERROR: nothing is staged. Use tell_agent or spawn_task "
@@ -987,6 +1064,39 @@ async def entrypoint(ctx: JobContext):
                 await asyncio.sleep(5)
 
     mate = Mate(herdr)
+
+    # Spoken-passphrase gate: second factor on top of the allowlist, since
+    # caller ID can be spoofed. Only SIP callers are gated — console and
+    # playground participants already authenticated with a LiveKit token.
+    # Verification runs in code on the raw transcript (on_user_turn_completed);
+    # the LLM never sees a locked turn.
+    sip_present = any(sip_caller(p.attributes) is not None
+                      for p in ctx.room.remote_participants.values())
+    if sip_present and passphrase_required():
+        phrase = configured_phrase()
+        if not phrase:
+            # unreachable when launched via __main__ (ensure_launch_phrase),
+            # but fail closed if the gate is on with nothing to check against
+            logger.error("%s required but not set — rejecting call",
+                         PHRASE_VAR)
+            try:
+                await ctx.api.room.delete_room(
+                    lk_api.DeleteRoomRequest(room=ctx.room.name))
+            except Exception:
+                logger.exception("could not delete room (no passphrase set)")
+            return
+
+        async def _hangup_failed_caller() -> None:
+            logger.warning("caller failed the passphrase %d times — "
+                           "hanging up", Mate.MAX_PASSPHRASE_ATTEMPTS)
+            try:
+                await ctx.api.room.delete_room(
+                    lk_api.DeleteRoomRequest(room=ctx.room.name))
+            except Exception:
+                logger.exception("could not hang up failed-passphrase caller")
+
+        mate.lock(phrase, _hangup_failed_caller)
+
     watcher = asyncio.create_task(watch_fleet())
 
     async def _stop_watcher():
@@ -996,13 +1106,12 @@ async def entrypoint(ctx: JobContext):
 
     await session.start(agent=mate, room=ctx.room)
     # deterministic greeting -- no LLM roll on the very first thing heard
-    try:
-        snap = await herdr.snapshot()
-        n = len(snap.get("agents", []))
-        fleet = f"{n} agent{'s' if n != 1 else ''} running"
-    except Exception:
-        fleet = "your fleet is up"
-    await session.say(f"G'day mate. {fleet}. What do you need?")
+    if mate.locked:
+        # no fleet details before the caller proves who they are
+        await session.say("G'day. What's the passphrase?")
+    else:
+        await session.say(f"G'day mate. {await fleet_greeting(herdr)}. "
+                          "What do you need?")
 
 
 def _require_allowlist(argv: list[str], env=None) -> None:
@@ -1019,4 +1128,5 @@ def _require_allowlist(argv: list[str], env=None) -> None:
 
 if __name__ == "__main__":
     _require_allowlist(sys.argv)
+    ensure_launch_phrase(sys.argv)
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
