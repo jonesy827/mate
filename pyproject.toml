@@ -1,5 +1,5 @@
 [project]
-name = "matebridge"
+name = "mate"
 version = "0.1.0"
 description = "Voice bridge: phone-call an assistant that supervises coding agents in herdr"
 requires-python = ">=3.12"

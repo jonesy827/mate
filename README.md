@@ -1,0 +1,228 @@
+# mate
+
+Voice bridge: phone-call "Mate", a hands-free assistant that supervises a
+fleet of coding agents running in [herdr](https://herdr.dev). Built to be
+used from the car — spawn agents, hand them tasks, hear their results, all
+over a real phone call.
+
+(The Python package is still named `matebridge`, so commands and module
+paths below say `matebridge` — that's the import name, not the project
+name.)
+
+```
+your phone
+   │  PSTN
+   ▼
+Telnyx DID (+1 405 279 0756)
+   │  SIP trunk
+   ▼
+LiveKit Cloud SIP  (inbound trunk → dispatch rule → room mate-call-<caller>-<rand>)
+   │  WebRTC
+   ▼
+mate worker (this repo, runs on the workstation)
+   │  STT ⇄ LLM ⇄ TTS, all local:
+   │    :8001 faster-whisper (STT)   :8003 llama.cpp qwen (LLM)   :8880 kokoro (TTS)
+   ▼
+herdr unix socket (~/.config/herdr/herdr.sock)
+   └─ workspaces/panes hosting claude-code agents
+```
+
+Media/infra services live in `../matebridge-infra` — see its README for
+bring-up. **Nothing in this project starts at boot.**
+
+## Running
+
+Prereqs: infra services up (see `../matebridge-infra`), the llama.cpp unit
+started by hand (`systemctl --user start llama-qwen-long`), and herdr
+running (`tmux new-session -d -s herdr-host herdr`).
+
+```sh
+.venv/bin/python -m matebridge.agent console   # desk test: terminal mic/speaker
+set -a && source .env && set +a
+.venv/bin/python -m matebridge.agent dev       # real worker: registers with LiveKit
+```
+
+The worker preflights llm/stt/tts/herdr and refuses to start with a clear
+list of whatever is unreachable. Once registered, an inbound call to the DID
+dispatches a job and Mate answers.
+
+Two operational rules learned the hard way:
+
+- **Never restart the worker during a call** — check first:
+  `lk room list | grep mate-call-` must be empty.
+- Dev-mode job processes re-import the code per call, so edits usually go
+  live on the *next* call without a restart; restart anyway (between calls)
+  when you need certainty.
+
+## Configuration (`.env`, gitignored, chmod 600)
+
+| var | purpose |
+|---|---|
+| `LIVEKIT_URL` / `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | LiveKit Cloud project the worker registers with |
+| `TELNYX_API_KEY` | Telnyx API (number/trunk management) |
+| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | Telegram bridge (below) |
+| `LLM_URL` `STT_URL` `TTS_URL` | override local endpoints (defaults `:8003` `:8001` `:8880`) |
+| `LLM_MODEL` `STT_MODEL` `TTS_VOICE` | model/voice overrides (default voice `af_heart`) |
+
+`.env` holds real credentials — never commit it, never paste it into logs.
+
+## One-time phone/SIP setup (as deployed)
+
+Self-hosted LiveKit was abandoned (it hard-crashed this host twice — see the
+infra README); the live path uses **LiveKit Cloud SIP**:
+
+1. **Telnyx**: buy a DID, create a SIP connection/trunk, point its
+   destination at your LiveKit Cloud project's SIP URI, assign the DID to it.
+2. **LiveKit Cloud** (with `lk` configured for the project):
+
+   ```sh
+   # inbound trunk accepting the DID (ours: ST_4yZYpgU6A4cs "telnyx-inbound")
+   lk sip inbound create trunk.json     # numbers: ["+14052790756"]
+
+   # dispatch rule: one room per caller (ours: SDR_CZAxhc79FxHU "mate-calls")
+   lk sip dispatch create dispatch.json # individual/caller → mate-call-_<caller>_<random>
+   ```
+3. Run the worker (`... agent dev`). It registers with the Cloud project;
+   inbound calls dispatch to it automatically.
+
+To restrict who can call in, set `AllowedNumbers` on the inbound trunk.
+
+## How Mate works
+
+`src/matebridge/agent.py` defines the `Mate` agent and its tools:
+
+- **Fleet**: `fleet_status`, `read_pane`, `agent_report` (reads the agent's
+  actual replies from its session transcript), `wait_for_agent`,
+  `list_known_agents` / `forget_agent`.
+- **Acting on agents**: `tell_agent` (message a pane's agent), `spawn_task`
+  (new worktree + branch), `spawn_in_folder` (workspace directly in an
+  existing folder; empty task means "open ready and wait"), `send_answer`
+  (answer TUI prompts; a destructive-looking prompt is staged through the
+  rail instead of sent — there is no bypass tool).
+- **Rail**: `send_staged` / `discard_staged`.
+
+### The stage-and-confirm rail
+
+Voice transcription is lossy, so nothing outward happens on one utterance.
+`tell_agent` / `spawn_task` / `spawn_in_folder` **stage** the action and read
+it back word for word; delivery happens only when `send_staged` runs *and*
+code (not the LLM) verifies the raw transcript of a **new** user turn
+contains a clear yes with no veto words. Saying "guardrails off" (voice
+toggle, detected in code) switches to immediate delivery; "guardrails on"
+restores the rail.
+
+Approving an agent's pending TUI prompt takes the same rail when the
+on-screen action looks destructive (`safety.py`'s heuristic): `send_answer`
+stages the keys and delivery needs the same code-verified spoken yes.
+"Guardrails off" does **not** bypass this — the toggle covers messaging and
+spawn convenience, never destructive approvals.
+
+### Background delivery and the watcher
+
+Spawns return immediately; the task is handed over by a background deliverer
+that waits out the agent's whole boot (up to 120 s). During a call,
+`watch_fleet` subscribes to pane status events and announces deliveries and
+finishes ("Hey mate, the songhaus agent just finished…"), speaking a
+sanitized two-sentence summary (`tts_sanitize` / `tts_summary` — so agents'
+final replies should front-load the key finding). A `Delegations` clock
+guards the race where a pane looks idle only because herdr is still typing:
+"finished" is announced only for panes that were actually seen working, and
+a pane that never starts gets one Enter nudge instead of a stale
+announcement.
+
+## herdr integration notes (`herdr_client.py`)
+
+herdr is an external project — mate **never patches it**; everything
+below is a client-side workaround, each pinned by a test:
+
+- **Names are sanitized**: herdr agent names must match
+  `^[a-z][a-z0-9_-]{0,31}$`; any folder/branch label is folded to fit
+  ("RackCoach" → "rackcoach") before `agent.start`.
+- **A slow boot is not a failed launch**: the workspace is torn down only if
+  `agent.start` itself fails. Prompt delivery retries `agent_not_ready` for
+  up to 120 s, and `timeout_ms` stretches herdr's own 30 s launch deadline
+  to match.
+- **Stuck-launch fallback** (herdr 0.7.5 bug, seen live twice): a managed
+  launch can stay `launch_pending` forever while the agent is visibly idle,
+  refusing every prompt. After ~20 s of refusals, if `agent.list` proves a
+  settled coding agent owns the pane, the message is typed into the pane
+  directly. The fallback **never** fires on a bare shell — typed task text
+  would execute as a shell command.
+- **Enter nudge**: Claude Code's paste guard sometimes swallows the Enter
+  herdr sends after typing, leaving the message stuck in the input box.
+  Every delivery is followed ~2 s later by one bare Enter — no-op if the
+  message submitted, rescue if it didn't.
+- Protocol ground truth (one request per connection, events.subscribe
+  framing, etc.) is documented in the module docstring and enforced by
+  `tests/test_herdr_client.py`'s fake server.
+
+## Telegram notifications (`telegram_bridge`)
+
+A standalone daemon pushes fleet events to your phone — "songhaus: agent
+finished" plus the agent's last reply — and routes typed replies back to
+agents. It runs outside any voice session (the voice agent's watcher only
+lives during a call). Started by hand, never at boot:
+
+```sh
+.venv/bin/python -m matebridge.telegram_bridge
+```
+
+### One-time setup
+
+1. In Telegram, open **@BotFather** → `/newbot` → pick a display name
+   (e.g. "Mate") and a unique username ending in `bot`. BotFather replies
+   with the **bot token** (`123456789:AA...`).
+2. Optional hardening: `/setjoingroups` → Disable.
+3. **Message your new bot once** (search its username, Start, say "hi") —
+   bots cannot initiate chats.
+4. Get your numeric **chat id**:
+   ```sh
+   curl -s "https://api.telegram.org/bot<TOKEN>/getUpdates" | python -m json.tool
+   # chat id = result[0].message.chat.id
+   ```
+5. Put both in `.env` here (gitignored; keep it private):
+   ```sh
+   cat >> .env <<'EOF'
+   TELEGRAM_BOT_TOKEN=123456789:AA...
+   TELEGRAM_CHAT_ID=987654321
+   EOF
+   chmod 600 .env
+   ```
+6. Verify:
+   ```sh
+   curl -s -X POST "https://api.telegram.org/bot<TOKEN>/sendMessage" \
+        -d chat_id=<ID> -d text="mate online"    # phone buzzes
+   ```
+
+### Talking back from the phone
+
+- **Reply** to any bridge notification → your text goes to that agent.
+- `songhaus: run the tests` → prefix-matches a workspace label and goes to
+  its agent.
+
+Typed text is deterministic input, so there is no confirmation rail here
+(unlike voice). Messages from any chat id other than yours are dropped
+silently. The bot token is a credential — anyone holding it controls the
+bot. BotFather `/revoke` rotates it.
+
+## Development
+
+```sh
+.venv/bin/python -m pytest tests/ -q
+```
+
+Every live-discovered bug gets a pinning test before (or with) its fix; the
+suite runs with no network, herdr, or GPU — herdr is faked at the protocol
+level (`test_herdr_client.py`) or the client level (recording fakes in the
+other files).
+
+| module | role |
+|---|---|
+| `agent.py` | the Mate voice agent: tools, rail, watcher, entrypoint |
+| `herdr_client.py` | async herdr socket client + spawn/delivery logic |
+| `folders.py` | folder-name → path resolution for `spawn_in_folder` |
+| `transcripts.py` | reading claude session transcripts for `agent_report` |
+| `safety.py` | transcript approval / veto detection for the rail |
+| `notify.py` | Telegram send helper |
+| `telegram_bridge.py` | standalone phone↔fleet daemon |
+| `scripts/smoke_llm.py` | quick local-LLM sanity check |
