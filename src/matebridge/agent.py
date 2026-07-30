@@ -15,6 +15,8 @@ import asyncio
 import json
 import logging
 import os
+import re
+from pathlib import Path
 
 import httpx
 from livekit.agents import (
@@ -40,11 +42,42 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "qwen3.6-35b-a3b-long")
 STT_MODEL = os.environ.get("STT_MODEL", "Systran/faster-whisper-medium")
 TTS_VOICE = os.environ.get("TTS_VOICE", "af_heart")
 
+# Claude Code writes one JSONL transcript per session under
+# ~/.claude/projects/<munged-cwd>/<session-id>.jsonl. herdr's integration hook
+# reports the session id + cwd, which is enough to find it.
+CLAUDE_PROJECTS = Path(os.path.expanduser("~/.claude/projects"))
+
+
+def claude_transcript_path(cwd: str, session_id: str) -> Path:
+    munged = re.sub(r"[^A-Za-z0-9-]", "-", cwd)
+    return CLAUDE_PROJECTS / munged / f"{session_id}.jsonl"
+
+
+def read_transcript_replies(path: Path, count: int) -> list[str]:
+    """Last `count` assistant text messages from a Claude Code transcript."""
+    texts: list[str] = []
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if entry.get("type") != "assistant":
+                continue
+            for block in entry.get("message", {}).get("content", []):
+                if (isinstance(block, dict) and block.get("type") == "text"
+                        and block.get("text", "").strip()):
+                    texts.append(block["text"])
+    return texts[-count:]
+
 INSTRUCTIONS = """You are Mate, a hands-free voice assistant supervising a fleet of
 coding agents in herdr. The user is often driving. Speak short, natural sentences:
 no markdown, no lists, no code blocks, no emoji. Two to four sentences unless asked.
 
 Always refresh state with tools before reporting status; never answer from memory.
+For "what did the agent say/find/conclude", prefer agent_report (full replies from
+its transcript). Use read_pane for what is on screen now: pending prompts, errors,
+running commands.
 Resolve casual project names to workspace labels via fleet_status. If a reference
 is genuinely ambiguous, ask one short question instead of guessing.
 Before approving anything an agent is waiting on, read its pane and tell the user
@@ -112,6 +145,35 @@ class Mate(Agent):
         except HerdrError as e:
             return f"ERROR: {e.code}: {e.message} (pane {pane_id})"
         return "sent"
+
+    @function_tool
+    async def agent_report(self, ctx: RunContext, pane_id: str,
+                           messages: int = 1):
+        """Read the coding agent's last full reply/replies from its session
+        transcript. Better than read_pane for "what did it say/find" — screen
+        scrollback loses long answers, the transcript never does."""
+        try:
+            snap = await self.herdr.snapshot()
+        except HerdrError as e:
+            return f"ERROR: {e.code}: {e.message}"
+        agent = next((a for a in snap.get("agents", [])
+                      if a.get("pane_id") == pane_id), None)
+        if agent is None:
+            return (f"ERROR: no coding agent is registered in pane {pane_id}. "
+                    "Use read_pane to see the raw terminal instead.")
+        session = agent.get("agent_session") or {}
+        if agent.get("agent") != "claude" or session.get("kind") != "id":
+            return ("ERROR: transcript reading is only wired up for claude "
+                    "agents. Use read_pane instead.")
+        path = claude_transcript_path(agent.get("cwd", ""), session["value"])
+        try:
+            replies = read_transcript_replies(path, max(1, min(messages, 10)))
+        except OSError:
+            return (f"ERROR: transcript not readable at {path}. "
+                    "Use read_pane instead.")
+        if not replies:
+            return "The agent has not written any replies yet this session."
+        return "\n\n---\n\n".join(replies)[-8000:]
 
     @function_tool
     async def tell_agent(self, ctx: RunContext, pane_id: str, text: str):
