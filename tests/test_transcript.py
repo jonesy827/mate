@@ -52,19 +52,19 @@ def codex_agent(pane_id="w1:p1"):
 
 # --- adapter registry -------------------------------------------------------
 
-def test_adapter_registry_claude_only():
+def test_adapter_registry_supports_codex():
     assert transcripts_mod.adapter_for("claude") is not None
-    assert transcripts_mod.adapter_for("codex") is None
+    assert transcripts_mod.adapter_for("codex") is not None
     assert transcripts_mod.adapter_for(None) is None
-    assert transcripts_mod.supported_kinds() == "claude"
+    assert transcripts_mod.supported_kinds() == "claude, codex"
 
 
 async def test_agent_report_names_unsupported_harness(tmp_path, monkeypatch):
     monkeypatch.setattr(transcripts_mod, "CLAUDE_PROJECTS", tmp_path)
-    mate = Mate(SnapshotHerdr([codex_agent()]))
+    mate = Mate(SnapshotHerdr([dict(codex_agent(), agent="gemini")]))
     out = await mate.agent_report(None, pane_id="w1:p1")
     assert out.startswith("ERROR")
-    assert "codex" in out and "claude" in out and "read_pane" in out
+    assert "gemini" in out and "claude" in out and "read_pane" in out
 
 
 async def test_agent_last_reply_none_for_unsupported_harness(tmp_path,
@@ -72,7 +72,7 @@ async def test_agent_last_reply_none_for_unsupported_harness(tmp_path,
     monkeypatch.setattr(transcripts_mod, "CLAUDE_PROJECTS", tmp_path)
     write_transcript(tmp_path, ["should never be read"])
     reply = await transcripts_mod.agent_last_reply(
-        SnapshotHerdr([codex_agent()]), "w1:p1")
+        SnapshotHerdr([dict(codex_agent(), agent="gemini")]), "w1:p1")
     assert reply is None
 
 

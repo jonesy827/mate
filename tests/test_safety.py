@@ -48,6 +48,11 @@ APPROVALS = [
     "Do it.",
     "Send it!",
     "confirm",
+    "okay",                     # the most common spoken yes
+    "OK.",
+    "Okay, send it.",
+    "sure",
+    "Sure, go ahead.",
 ]
 
 REJECTIONS = [
@@ -65,6 +70,19 @@ REJECTIONS = [
     "",                         # empty transcript -> block
     "redo item three",          # must NOT substring-match "do it"
     "wait... yes",              # veto outranks affirmative
+    "no okay wait",             # veto outranks "okay" too
+    "okay, hold on",
+    "sure, but not that branch",
+    # hesitations with no veto WORD in them: accepting okay/sure makes
+    # these the dangerous case, because they are what people actually say
+    # while they think
+    "Okay, hang on",
+    "Okay, never mind",
+    "Sure, one second",
+    "okay one sec",
+    "okay scrap that",
+    "sure, give me a minute",
+    "yeah hang on a sec",
 ]
 
 

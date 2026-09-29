@@ -12,6 +12,9 @@ dependencies = [
     # agent.py (endpoint preflight) imports it unconditionally -- it is
     # not just a test dependency
     "httpx==0.28.1",
+    # GPT-Live uses its own wire protocol; the pinned LiveKit plugin only
+    # implements Realtime. Keep this transport explicit and tested.
+    "websockets==15.0.1",
 ]
 
 [project.optional-dependencies]

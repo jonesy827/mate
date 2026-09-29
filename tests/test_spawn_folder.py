@@ -53,9 +53,12 @@ def make_roots(tmp_path, *names):
 
 
 def make_mate(tmp_path, *dirnames):
+    # the fake stands in for the delivery quirk layer (spawn_in_folder,
+    # deliver_task); Mate's own herdr is never touched by these paths
     herdr = RecordingHerdr()
     known = KnownAgents(tmp_path / "known.json")
-    mate = Mate(herdr, known=known, roots=make_roots(tmp_path, *dirnames))
+    mate = Mate(herdr, known=known, roots=make_roots(tmp_path, *dirnames),
+                delivery=herdr)
     return mate, herdr
 
 

@@ -18,7 +18,7 @@ import os
 import re
 import signal
 import sys
-import time
+import unicodedata
 
 import httpx
 from livekit import api as lk_api
@@ -31,23 +31,23 @@ from livekit.agents import (
     WorkerOptions,
     cli,
     function_tool,
+    room_io,
 )
 from livekit.plugins import openai, silero
 
-from .allowlist import ENV_VAR, allowed_callers, is_allowed, sip_caller
+from .allowlist import ENV_VAR, allowed_callers
+from .delivery import Delivery
 from .folders import KnownAgents, resolve_folder, speakable_path
 from .herdr_client import HerdrClient, HerdrError, protocol_note
 from .passphrase import (
-    MAX_FAILED_CALLS,
-    PHRASE_VAR,
     FailedCalls,
-    configured_phrase,
     ensure_launch_phrase,
-    passphrase_required,
     phrase_heard,
 )
 from .safety import approves_send, is_destructive
-from .transcripts import adapter_for, supported_kinds
+from .screening import CallScreen
+from .transcripts import adapter_for, resolve_agent_session, supported_kinds
+from .watcher import Delegations, FleetWatcher
 
 logger = logging.getLogger("mate")
 
@@ -87,11 +87,6 @@ def llm_options() -> dict:
         )
     return opts
 
-# pane.agent_status_changed subscriptions are per-pane, so the fleet watcher
-# resubscribes on this interval to pick up panes created since (spawn_task
-# and friends). Also bounds the catch-up latency for events missed while
-# between subscriptions.
-WATCH_RESUBSCRIBE_SECS = 30.0
 
 INSTRUCTIONS = """You are Mate, a hands-free voice assistant supervising a fleet of
 coding agents in herdr. The user is often driving and cannot look at a screen.
@@ -168,6 +163,12 @@ def tts_sanitize(text: str) -> str:
     text = re.sub(r"^[ \t]*(?:[-*+]|\d+[.)])[ \t]+", "", text, flags=re.M)
     text = re.sub(r"^#{1,6}[ \t]+", "", text, flags=re.M)
     text = re.sub(r"[*_#>|~]", "", text)
+    # transliterate before the ascii filter, or accented words lose letters
+    # instead of keeping them: "naive" not "nave", "cafe" not "caf".
+    # NFKD splits a letter from its accent; dropping the combining marks
+    # leaves the plain ascii letter behind.
+    text = "".join(ch for ch in unicodedata.normalize("NFKD", text)
+                   if not unicodedata.combining(ch))
     text = "".join(ch for ch in text
                    if ch.isascii() and (ch.isprintable() or ch in "\n\t"))
     return re.sub(r"\s+", " ", text).strip()
@@ -206,68 +207,6 @@ def detect_rail_toggle(transcript: str) -> bool | None:
     if on == off == -1:
         return None
     return on > off
-
-
-class Delegations:
-    """Panes handed work this call, with enough state to tell a real finish
-    from the delivery race: right after prompt_agent returns, herdr is still
-    typing the prompt into the pane, so the pane sits idle for a couple of
-    seconds — idle+delegated alone must NOT count as finished, or the watcher
-    announces a stale reply and permanently eats the real notification.
-
-    A pane is finish_ready once it has been seen working. If it is never seen
-    working within GRACE_SECS, that usually means herdr's delayed Enter got
-    swallowed by the agent's paste guard and the prompt is sitting typed but
-    unsubmitted — the watcher then sends a one-shot Enter nudge (needs_nudge/
-    mark_nudged). Only after the nudge plus a second grace window with still
-    no working state does idle count as finished (a task so quick that every
-    observation missed the working state)."""
-
-    GRACE_SECS = 20.0
-
-    def __init__(self, clock=time.monotonic):
-        self._clock = clock
-        self._panes: dict[str, dict] = {}
-
-    def add(self, pane_id: str) -> None:
-        self._panes[pane_id] = {"at": self._clock(), "started": False,
-                                "nudged": False}
-
-    def discard(self, pane_id: str) -> None:
-        self._panes.pop(pane_id, None)
-
-    def mark_started(self, pane_id: str) -> None:
-        entry = self._panes.get(pane_id)
-        if entry:
-            entry["started"] = True
-
-    def needs_nudge(self, pane_id: str) -> bool:
-        entry = self._panes.get(pane_id)
-        if entry is None:
-            return False
-        return (not entry["started"] and not entry["nudged"]
-                and self._clock() - entry["at"] >= self.GRACE_SECS)
-
-    def mark_nudged(self, pane_id: str) -> None:
-        entry = self._panes.get(pane_id)
-        if entry:
-            entry["nudged"] = True
-            entry["at"] = self._clock()  # fresh grace window after the nudge
-
-    def finish_ready(self, pane_id: str) -> bool:
-        entry = self._panes.get(pane_id)
-        if entry is None:
-            return False
-        if entry["started"]:
-            return True
-        return (entry["nudged"]
-                and self._clock() - entry["at"] >= self.GRACE_SECS)
-
-    def __contains__(self, pane_id: str) -> bool:
-        return pane_id in self._panes
-
-    def __iter__(self):
-        return iter(self._panes)
 
 
 async def fleet_greeting(herdr) -> str:
@@ -324,11 +263,20 @@ class Mate(Agent):
     # a passphrase attempt longer than this is a miss no matter what it
     # contains — one turn can't be stuffed with candidate phrases
     MAX_PASSPHRASE_SPEECH_SECS = 15.0
+    # _staged is a single slot, so a late "yes" would otherwise deliver
+    # whatever was staged however many turns ago. After this many user
+    # turns the stage expires: the read-back is no longer what the user has
+    # in mind, and the model must stage and read back again.
+    MAX_STAGED_TURNS = 3
 
     def __init__(self, herdr: HerdrClient, known: KnownAgents | None = None,
-                 roots: list | None = None):
+                 roots: list | None = None, delivery: Delivery | None = None):
         super().__init__(instructions=INSTRUCTIONS)
         self.herdr = herdr
+        # spawning and task delivery go through the quirk layer (herdr 0.7.5
+        # workarounds); plain reads/keys go straight to the protocol client.
+        # Injectable so tests can record deliveries without a real socket.
+        self.delivery = delivery if delivery is not None else Delivery(herdr)
         # name -> path memory of spawn targets the user has confirmed;
         # roots override is for tests (default: MATE_SRC_ROOTS / ~/src)
         self.known = known if known is not None else KnownAgents()
@@ -358,6 +306,9 @@ class Mate(Agent):
         self._attempts = 0
         self._hangup = None
         self._on_unlock = None
+        # The Live path supplies a contextual classifier. The chained
+        # pipeline retains its existing deterministic confirmation check.
+        self._approval_gate = None
 
     def lock(self, phrase: str, hangup=None, on_unlock=None) -> None:
         """Arm the spoken-passphrase gate. Until the caller says `phrase`,
@@ -431,13 +382,18 @@ class Mate(Agent):
             + ("already " if already else "now ") + state
             + ". Briefly confirm this to the user.]")
 
-    async def _pane_label(self, pane_id: str) -> str:
+    async def _pane_label(self, pane_id: str, snap: dict | None = None) -> str:
         """Speakable name for a pane — workspace label, else pane title, else
-        a generic fallback. Pane ids read as gibberish over TTS."""
-        try:
-            snap = await self.herdr.snapshot()
-        except HerdrError:
-            return "coding"
+        a generic fallback. Pane ids read as gibberish over TTS.
+
+        `snap` is an already-fetched session snapshot: the watcher's finish
+        announcement needs the label and the reply together, and one
+        snapshot serves both. None fetches a fresh one."""
+        if snap is None:
+            try:
+                snap = await self.herdr.snapshot()
+            except HerdrError:
+                return "coding"
         pane = next((p for p in snap.get("panes", [])
                      if p.get("pane_id") == pane_id), None)
         if pane:
@@ -453,6 +409,9 @@ class Mate(Agent):
     @function_tool
     async def fleet_status(self, ctx: RunContext):
         """Full fleet snapshot: every workspace, pane, agent and its state."""
+        # defense in depth behind the on_user_turn_completed intercept
+        if self.locked:
+            return LOCKED_MSG
         snap = await self.herdr.snapshot()
         # trim to what the router needs; keep the prompt small for prefill speed
         return json.dumps({
@@ -472,6 +431,9 @@ class Mate(Agent):
     @function_tool
     async def read_pane(self, ctx: RunContext, pane_id: str, lines: int = 60):
         """Read the last lines of a pane's terminal output (what an agent is doing or asking)."""
+        # defense in depth behind the on_user_turn_completed intercept
+        if self.locked:
+            return LOCKED_MSG
         try:
             text = await self.herdr.read_pane(pane_id, lines)
         except HerdrError as e:
@@ -499,6 +461,7 @@ class Mate(Agent):
                 # and spawns, never this
                 self._staged = {"kind": "keys", "pane_id": pane_id,
                                 "keys": keys,
+                                "screen": text,
                                 "turns": len(user_transcripts(ctx))}
                 return (f"NOT SENT: the pending action looks destructive, so "
                         f"the keys {keys} are staged for pane {pane_id}. Read "
@@ -511,33 +474,50 @@ class Mate(Agent):
             return f"ERROR: {e.code}: {e.message} (pane {pane_id})"
         return "sent"
 
-    async def _agent_replies(self, pane_id: str, messages: int = 1) -> str:
+    async def _agent_replies(self, pane_id: str, messages: int = 1,
+                             snap: dict | None = None) -> str:
         """Last replies from the pane's agent transcript, or an ERROR string.
-        Dispatches on the harness via the transcripts adapter registry."""
-        try:
-            snap = await self.herdr.snapshot()
-        except HerdrError as e:
-            return f"ERROR: {e.code}: {e.message}"
+        Dispatches on the harness via the transcripts adapter registry.
+        `snap` reuses a caller's session snapshot (see _pane_label); None
+        fetches a fresh one."""
+        if snap is None:
+            try:
+                snap = await self.herdr.snapshot()
+            except HerdrError as e:
+                return f"ERROR: {e.code}: {e.message}"
         agent = next((a for a in snap.get("agents", [])
                       if a.get("pane_id") == pane_id), None)
         if agent is None:
             return (f"ERROR: no coding agent is registered in pane {pane_id}. "
                     "Use read_pane to see the raw terminal instead.")
+        agent = await resolve_agent_session(self.herdr, agent)
         kind = agent.get("agent")
         reader = adapter_for(kind)
         session = agent.get("agent_session") or {}
-        if reader is None or session.get("kind") != "id":
-            return (f"ERROR: no transcript adapter for {kind} agents "
-                    f"(adapters exist for: {supported_kinds()}). "
-                    "Use read_pane instead.")
-        try:
-            replies = reader(agent.get("cwd", ""), session["value"],
-                             max(1, min(messages, 10)))
-        except OSError:
-            return (f"ERROR: the {kind} transcript is not readable. "
-                    "Use read_pane instead.")
+        reason = None
+        replies = []
+        if reader is None:
+            reason = f"no transcript adapter for {kind} (supported: {supported_kinds()})"
+        elif session.get("kind") != "id":
+            reason = "native session identity is missing"
+        else:
+            try:
+                replies = await asyncio.to_thread(reader, agent.get("cwd", ""), session["value"],
+                                                 max(1, min(messages, 10)))
+            except (OSError, KeyError):
+                reason = "transcript is unavailable"
         if not replies:
-            return "The agent has not written any replies yet this session."
+            from .audit import event as trace
+            reason = reason or "no final reply in the current transcript segment"
+            trace("agent.report_fallback", pane_id=pane_id, agent=kind, reason=reason)
+            try:
+                screen = await self.herdr.read_pane(pane_id, 100)
+            except (HerdrError, OSError, AttributeError):
+                return f"ERROR: {reason}; could not read_pane either."
+            if not screen.strip():
+                return f"ERROR: {reason}; the agent screen is empty."
+            return ("From the agent's screen (partial view, not a verified full reply):\n"
+                    + screen[-8000:])
         return "\n\n---\n\n".join(replies)[-8000:]
 
     @function_tool
@@ -546,6 +526,9 @@ class Mate(Agent):
         """Read the coding agent's last full reply/replies from its session
         transcript. Better than read_pane for "what did it say/find" — screen
         scrollback loses long answers, the transcript never does."""
+        # defense in depth behind the on_user_turn_completed intercept
+        if self.locked:
+            return LOCKED_MSG
         return await self._agent_replies(pane_id, messages)
 
     @function_tool
@@ -555,6 +538,9 @@ class Mate(Agent):
         reply. Use after tell_agent for QUICK questions only. If it is still
         working when time runs out, do NOT call again — the user will be
         notified automatically when the agent finishes."""
+        # defense in depth behind the on_user_turn_completed intercept
+        if self.locked:
+            return LOCKED_MSG
         deadline = asyncio.get_event_loop().time() + max(1, min(seconds, 20))
         status = "unknown"
         while asyncio.get_event_loop().time() < deadline:
@@ -603,11 +589,11 @@ class Mate(Agent):
         """Hand the first prompt to a freshly spawned agent without blocking
         the call: claude can take minutes to boot (herdr answers
         agent_not_ready the whole time), and killing or stalling on that
-        would be wrong — the songhaus bug. The pane joins `delegated` only
-        once the task actually lands, so the watcher's grace/nudge clock
-        starts at delivery, not at spawn. An empty task means the user asked
+        would be wrong — the songhaus bug. An empty task means the user asked
         for an agent with nothing to do yet — herdr rejects empty prompts
-        (empty_agent_prompt), so there is nothing to deliver."""
+        (empty_agent_prompt), so there is nothing to deliver. The pane joins
+        `delegated` only once the task actually lands, so the watcher's grace
+        clock starts at delivery, not at spawn."""
         if not pane_id or not task.strip():
             return
         t = asyncio.create_task(self._deliver_task_bg(pane_id, task, label))
@@ -617,7 +603,7 @@ class Mate(Agent):
     async def _deliver_task_bg(self, pane_id: str, task: str,
                                label: str) -> None:
         try:
-            await self.herdr.deliver_task(pane_id, task)
+            await self.delivery.deliver_task(pane_id, task)
         except Exception:
             logger.exception("background task delivery to %s (%s) failed",
                              pane_id, label)
@@ -629,18 +615,12 @@ class Mate(Agent):
                     pane_id, label)
         self.delegated.add(pane_id)
 
-    async def _nudge_after_tell(self, pane_id: str) -> None:
-        try:
-            await self.herdr.nudge_enter(pane_id)
-        except Exception:
-            logger.exception("post-tell enter nudge failed for %s", pane_id)
-
     async def _deliver(self, staged: dict) -> str:
         """Actually deliver a staged payload (shared by send_staged and the
         guardrails-off immediate path)."""
         if staged["kind"] == "spawn_folder":
             try:
-                result = await self.herdr.spawn_in_folder(
+                result = await self.delivery.spawn_in_folder(
                     staged["path"], staged["name"],
                     agent=staged.get("agent", "claude"))
             except HerdrError as e:
@@ -659,7 +639,7 @@ class Mate(Agent):
             return json.dumps(result)
         if staged["kind"] == "spawn":
             try:
-                result = await self.herdr.spawn(
+                result = await self.delivery.spawn(
                     staged["repo_path"], staged["branch"],
                     agent=staged.get("agent", "claude"))
             except HerdrError as e:
@@ -668,11 +648,34 @@ class Mate(Agent):
                 result.get("pane_id"), staged["task"], staged["branch"])
             return json.dumps(result)
         if staged["kind"] == "keys":
+            keys_pane = staged["pane_id"]
+            # what the user approved is a SCREEN, not a pane. Between the
+            # read-back and their yes the agent can have moved on, and these
+            # keys would then answer whatever dialog is up now. So re-read
+            # the pane and require the same destructive match before firing.
+            # Deliberately asymmetric: a destructive prompt that DISAPPEARED
+            # means the moment has passed, so a now-clean screen is a
+            # refusal, not a green light — keys must never go into an
+            # unknown screen. Regex-still-matches is the whole bar.
             try:
-                await self.herdr.send_keys(staged["pane_id"], staged["keys"])
+                current = await self.herdr.read_pane(keys_pane, 40)
             except HerdrError as e:
-                return (f"ERROR: {e.code}: {e.message} "
-                        f"(pane {staged['pane_id']})")
+                return (f"NOT SENT: pane {keys_pane} could not be re-read "
+                        f"before approving ({e.code}: {e.message}), so the "
+                        "keys were dropped. Call read_pane again and restart "
+                        "the approval.")
+            if not is_destructive(current):
+                return (f"NOT SENT: pane {keys_pane} is no longer showing the "
+                        "action that was read back, so the keys were dropped "
+                        "rather than sent into an unknown screen. Call "
+                        "read_pane again, tell the user what is on screen "
+                        "now, and restart the approval if they still want it.")
+            if staged.get("_confirmation") and current != staged.get("screen"):
+                return "NOT SENT: the approval screen changed. Read it again and stage a new confirmation."
+            try:
+                await self.herdr.send_keys(keys_pane, staged["keys"])
+            except HerdrError as e:
+                return f"ERROR: {e.code}: {e.message} (pane {keys_pane})"
             return "sent"
         pane_id = staged["pane_id"]
         try:
@@ -695,13 +698,8 @@ class Mate(Agent):
                         "another integrated agent) is launched inside a herdr pane. "
                         "Tell the user that pane has no agent to talk to.")
             return f"ERROR: {e.code}: {e.message} (pane {pane_id})"
-        # paste-guard self-heal: herdr accepted the prompt, but Claude Code
-        # sometimes eats the delayed Enter (seen live: message stuck in the
-        # input box, invisible to the watcher when the pane was already
-        # working). A trailing Enter is a no-op when delivery worked.
-        t = asyncio.create_task(self._nudge_after_tell(pane_id))
-        self._bg.add(t)
-        t.add_done_callback(self._bg.discard)
+        # herdr owns prompt submission now: 0.8.0 delays its own Enter past
+        # Claude Code's paste guard (#1878), so no trailing nudge is sent.
         self.delegated.add(pane_id)
         return ("delivered. For a quick question, call wait_for_agent once. "
                 "For anything longer, tell the user they'll be notified when "
@@ -833,6 +831,9 @@ class Mate(Agent):
     async def list_known_agents(self, ctx: RunContext):
         """Saved spawn targets (name and folder) the user has previously
         confirmed. Use when the user asks what agents/folders are known."""
+        # defense in depth behind the on_user_turn_completed intercept
+        if self.locked:
+            return LOCKED_MSG
         pairs = self.known.names()
         if not pairs:
             return "no known agents saved yet."
@@ -842,6 +843,9 @@ class Mate(Agent):
     async def forget_agent(self, ctx: RunContext, name: str):
         """Remove a saved spawn target from memory, so its next spawn needs
         the full path confirmation again."""
+        # defense in depth behind the on_user_turn_completed intercept
+        if self.locked:
+            return LOCKED_MSG
         if self.known.forget(name):
             return f"forgotten: {name}. Its next spawn needs full confirmation."
         return f'ERROR: no known agent matching "{name}".'
@@ -861,7 +865,24 @@ class Mate(Agent):
             return ("NOT SENT: the user has not replied to the read-back yet. "
                     "Read the staged message back, ask whether to send it, "
                     "and call send_staged after they answer.")
-        if not approves_send(turns[-1]):
+        if len(turns) - staged["turns"] > self.MAX_STAGED_TURNS:
+            # the conversation moved on; a "yes" this late is answering
+            # something else, not the read-back
+            self._staged = None
+            return ("NOT SENT: the staged item expired — the user has spoken "
+                    f"{len(turns) - staged['turns']} times since it was "
+                    "staged and it has been dropped. Stage it again, read the "
+                    "new staging back to the user word for word, and call "
+                    "send_staged only after they reply to that.")
+        approved = (await self._approval_gate(staged, ctx)
+                    if self._approval_gate is not None else approves_send(turns[-1]))
+        if self.locked or self._staged is not staged:
+            return "NOT SENT: authorization or the pending action changed during confirmation."
+        if not approved:
+            if self._approval_gate is not None:
+                return ("NOT SENT: could not verify approval of this exact action. "
+                        "The reply may be unclear or the approval check unavailable. "
+                        "Ask whether to proceed and wait for a new reply; if declined, discard it.")
             return ("NOT SENT: could not verify a clear yes in the user's "
                     f'last reply ("{turns[-1]}"). Ask again explicitly — '
                     '"should I send it?" — wait for the answer, then call '
@@ -873,6 +894,9 @@ class Mate(Agent):
     @function_tool
     async def discard_staged(self, ctx: RunContext):
         """Drop the staged message without sending it (user said no)."""
+        # defense in depth behind the on_user_turn_completed intercept
+        if self.locked:
+            return LOCKED_MSG
         if self._staged is None:
             return "nothing was staged."
         self._staged = None
@@ -886,6 +910,18 @@ async def check_endpoints() -> dict[str, str | None]:
         "stt": f"{STT_URL}/models",
         "tts": f"{TTS_URL}/models",
     }
+    live_config = None
+    mode = os.environ.get("MATE_VOICE_MODE", "local")
+    if mode not in ("local", "live"):
+        return {"config": "MATE_VOICE_MODE must be local or live"}
+    if mode == "live":
+        from .live import LiveConfig
+        try:
+            live_config = LiveConfig.from_env()
+        except ValueError as e:
+            return {"config": str(e)}
+        targets.pop("llm")
+        targets["openai"] = "https://api.openai.com/v1/models"
     errors: dict[str, str | None] = {}
     async with httpx.AsyncClient(timeout=3.0) as client:
         for name, url in targets.items():
@@ -893,9 +929,13 @@ async def check_endpoints() -> dict[str, str | None]:
             # makes the probe a real auth check
             headers = ({"Authorization": f"Bearer {LLM_API_KEY}"}
                        if name == "llm" else None)
+            if name == "openai":
+                headers = {"Authorization": f"Bearer {live_config.api_key}"}
             try:
                 r = await client.get(url, headers=headers)
-                bad_auth = name == "llm" and r.status_code in (401, 403)
+                bad_auth = name in ("llm", "openai") and r.status_code in (401, 403)
+                if name == "openai":
+                    r.raise_for_status()
                 errors[name] = (None if r.status_code < 500 and not bad_auth
                                 else f"HTTP {r.status_code}")
             except Exception as e:
@@ -915,6 +955,8 @@ async def check_endpoints() -> dict[str, str | None]:
 
 
 async def entrypoint(ctx: JobContext):
+    from .audit import configure
+    configure(ctx.job.id)
     status = await check_endpoints()
     down = {k: v for k, v in status.items() if v}
     if down:
@@ -926,45 +968,53 @@ async def entrypoint(ctx: JobContext):
 
     await ctx.connect()
 
-    # Caller gate. Only SIP participants (they carry sip.phoneNumber) are
-    # screened — console/playground participants already authenticated with
-    # a LiveKit token. Fail-closed: an empty allowlist rejects every phone
-    # caller. This is the only boundary against a hostile caller; the
-    # confirmation rail guards against transcription error, not attackers.
-    allowed = allowed_callers()
-
-    async def _reject_call(caller: str) -> None:
-        logger.warning("blocked call from %s: not in %s", caller, ENV_VAR)
-        try:
-            await ctx.api.room.delete_room(
-                lk_api.DeleteRoomRequest(room=ctx.room.name))
-        except Exception:
-            logger.exception("could not delete room for blocked caller")
-
-    reject_tasks: set[asyncio.Task] = set()
-
-    def _screen_late_joiner(participant) -> None:
-        caller = sip_caller(participant.attributes)
-        if caller is not None and not is_allowed(caller, allowed):
-            t = asyncio.create_task(_reject_call(caller))
-            reject_tasks.add(t)
-            t.add_done_callback(reject_tasks.discard)
-
-    # The SIP caller is normally already in the room when the job starts
-    # (the dispatch rule created the room for them) — reject before the
-    # session ever opens its mouth. The event handler covers stragglers.
-    for p in list(ctx.room.remote_participants.values()):
-        caller = sip_caller(p.attributes)
-        if caller is not None and not is_allowed(caller, allowed):
-            await _reject_call(caller)
-            return
-    ctx.room.on("participant_connected", _screen_late_joiner)
-
     herdr = HerdrClient()
+    live_mode = os.environ.get("MATE_VOICE_MODE", "local") == "live"
+    if live_mode:
+        from .live import LiveConfig
+        from .live_agent import LiveMate
+        mate = LiveMate(herdr, LiveConfig.from_env())
+    else:
+        mate = Mate(herdr)
+    # assigned below; `say` and the watcher only ever run once it is live
+    session = None
+    watcher_holder: list[asyncio.Task] = []
+
+    async def delete_room() -> None:
+        await ctx.api.room.delete_room(
+            lk_api.DeleteRoomRequest(room=ctx.room.name))
+
+    async def say(text: str) -> None:
+        # session.say = deterministic TTS, no LLM in the loop. qwen has
+        # twice mangled generate_reply(instructions=...) at exactly this
+        # moment (once refusing to call a tool, once repeating its
+        # previous sentence verbatim instead of announcing), and the
+        # notification moment is too important to gamble on it.
+        # add_to_chat_ctx defaults True, so the model still knows what
+        # was said.
+        if live_mode:
+            await mate.bridge.announce(text)
+        else:
+            await session.say(text)
+
+    def start_watcher() -> None:
+        if not watcher_holder:
+            watcher_holder.append(asyncio.create_task(watcher.run()))
+
+    screen = CallScreen(mate, allowed_callers(), FailedCalls(),
+                        delete_room=delete_room, say=say, kill=kill_worker,
+                        start_watcher=start_watcher)
+
+    # Caller allowlist first: a blocked caller must never reach a session.
+    if not await screen.screen_participants(
+            ctx.room.remote_participants.values()):
+        return
+    ctx.room.on("participant_connected", screen.screen_late_joiner)
+
     session = AgentSession(
         vad=silero.VAD.load(),
         stt=openai.STT(base_url=STT_URL, api_key="local", model=STT_MODEL),
-        llm=openai.LLM(**llm_options()),
+        llm=None if live_mode else openai.LLM(**llm_options()),
         # "tts-1" (not "kokoro"): the plugin treats unknown model names as
         # OpenAI's SSE-streaming models and parses the response as SSE JSON,
         # but kokoro returns raw audio bytes -> "no audio frames were pushed".
@@ -986,252 +1036,52 @@ async def entrypoint(ctx: JobContext):
         },
     )
 
-    async def watch_fleet():
-        # Proactive interjection when an agent blocks, or when a pane Mate
-        # delegated to finishes (kills the "let me check again" loop).
-        #
-        # herdr's pane.agent_status_changed subscription is PER-PANE: a bare
-        # {"type": ...} is rejected with invalid_request (missing pane_id).
-        # So each cycle: snapshot -> subscribe to every current pane ->
-        # resubscribe every WATCH_RESUBSCRIBE_SECS to pick up new panes.
-        # The snapshot doubles as a catch-up pass for delegated panes that
-        # finished while we weren't subscribed.
-        async def say(text):
-            # session.say = deterministic TTS, no LLM in the loop. qwen has
-            # twice mangled generate_reply(instructions=...) at exactly this
-            # moment (once refusing to call a tool, once repeating its
-            # previous sentence verbatim instead of announcing), and the
-            # notification moment is too important to gamble on it.
-            # add_to_chat_ctx defaults True, so the model still knows what
-            # was said.
-            logger.info("watch_fleet: announcing: %s", text)
-            await session.say(text)
-            logger.info("watch_fleet: announcement spoken")
+    watcher = FleetWatcher(herdr, mate, say)
 
-        async def announce(status, pane_id, data):
-            if status == "working":
-                if pane_id in mate.delegated:
-                    mate.delegated.mark_started(pane_id)
-                    logger.info("watch_fleet: delegated pane %s started "
-                                "working", pane_id)
-                return
-            if status == "blocked":
-                label = await mate._pane_label(pane_id)
-                await say(f"Hey mate, the {label} agent is waiting on your "
-                          "approval. Want me to read its question?")
-            elif (status in ("idle", "done")
-                  and pane_id in mate.delegated):
-                if not mate.delegated.finish_ready(pane_id):
-                    # delivery race: the pane was never seen working after
-                    # delivery. Early on, herdr is still typing the prompt;
-                    # announcing now would read a STALE reply and discard the
-                    # pane, eating the real notification later.
-                    if mate.delegated.needs_nudge(pane_id):
-                        # grace expired with no working state: herdr's delayed
-                        # Enter was probably swallowed by the agent's paste
-                        # guard, leaving the prompt typed but unsubmitted.
-                        # One bare Enter submits it (and is a no-op on an
-                        # empty input box if it did go through).
-                        logger.warning("watch_fleet: pane %s never started "
-                                       "after delivery — nudging with Enter "
-                                       "(submit likely lost)", pane_id)
-                        try:
-                            await herdr.send_keys(pane_id, ["Enter"])
-                        except HerdrError as e:
-                            logger.warning("watch_fleet: nudge failed: %s", e)
-                        mate.delegated.mark_nudged(pane_id)
-                    else:
-                        logger.info("watch_fleet: pane %s idle but not "
-                                    "finish-ready yet, skipping", pane_id)
-                    return
-                mate.delegated.discard(pane_id)  # one announcement per task
-                # Fetch the reply here: asking qwen to call agent_report from
-                # an injected instruction doesn't work reliably.
-                reply = await mate._agent_replies(pane_id)
-                label = await mate._pane_label(pane_id)
-                if reply.startswith("ERROR"):
-                    logger.warning("watch_fleet: finish on %s but reply "
-                                   "unreadable: %s", pane_id, reply)
-                    await say(f"Hey mate, the {label} agent just finished, "
-                              "but I couldn't read its reply. Want me to "
-                              "read its screen instead?")
-                else:
-                    await say(f"Hey mate, the {label} agent just finished. "
-                              f"{tts_summary(reply)} Want the full report?")
+    # Spoken-passphrase gate: the LLM never sees a locked turn, and while
+    # locked the watcher does not run either — no fleet announcements to an
+    # unverified caller. The straggler handler is registered before the
+    # in-room callers are gated, so a caller arriving mid-arming is still
+    # covered.
+    ctx.room.on("participant_connected", screen.gate_late_sip_joiner)
 
-        while True:
-            try:
-                snap = await herdr.snapshot()
-                # catch-up: delegated panes that changed state between
-                # subscriptions (idle/done only -- re-announcing "blocked"
-                # every cycle would nag; "working" just marks started)
-                for a in snap.get("agents", []):
-                    if (a.get("pane_id") in mate.delegated
-                            and a.get("agent_status")
-                            in ("idle", "done", "working")):
-                        await announce(a["agent_status"], a["pane_id"], a)
-                pane_ids = [p["pane_id"] for p in snap.get("panes", [])
-                            if p.get("pane_id")]
-                logger.info("watch_fleet: cycle: %d panes, delegated=%s",
-                            len(pane_ids), list(mate.delegated))
-                if not pane_ids:
-                    await asyncio.sleep(WATCH_RESUBSCRIBE_SECS)
-                    continue
-                events = herdr.events(
-                    [{"type": "pane.agent_status_changed", "pane_id": p}
-                     for p in pane_ids])
-                loop = asyncio.get_running_loop()
-                deadline = loop.time() + WATCH_RESUBSCRIBE_SECS
-                try:
-                    while (remaining := deadline - loop.time()) > 0:
-                        # only the WAIT is under a timeout -- announce() can
-                        # hold the floor for 10+ s of TTS and must never be
-                        # cancelled mid-speech by the resubscribe deadline
-                        try:
-                            msg = await asyncio.wait_for(
-                                anext(events), remaining)
-                        except (TimeoutError, StopAsyncIteration):
-                            break
-                        data = msg.get("data", {})
-                        logger.info("watch_fleet: event pane=%s status=%s",
-                                    data.get("pane_id"),
-                                    data.get("agent_status"))
-                        await announce(data.get("agent_status"),
-                                       data.get("pane_id"), data)
-                finally:
-                    await events.aclose()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("watch_fleet: watcher error, retrying in 5s")
-                await asyncio.sleep(5)
-
-    mate = Mate(herdr)
-
-    # Spoken-passphrase gate: second factor on top of the allowlist, since
-    # caller ID can be spoofed. Only SIP callers are gated — console and
-    # playground participants already authenticated with a LiveKit token.
-    # Verification runs in code on the raw transcript (on_user_turn_completed);
-    # the LLM never sees a locked turn. While locked, watch_fleet does not
-    # run either — no fleet announcements to an unverified caller.
-    watcher_holder: list[asyncio.Task] = []
-    failed_calls = FailedCalls()
-
-    def _start_watcher() -> None:
-        if not watcher_holder:
-            watcher_holder.append(asyncio.create_task(watch_fleet()))
-
-    def _unlocked() -> None:
-        failed_calls.reset()  # an authenticated call ends the streak
-        _start_watcher()
-
-    async def _hangup_failed_caller() -> None:
-        logger.warning("caller failed the passphrase %d times — "
-                       "hanging up", Mate.MAX_PASSPHRASE_ATTEMPTS)
-        try:
-            await ctx.api.room.delete_room(
-                lk_api.DeleteRoomRequest(room=ctx.room.name))
-        except Exception:
-            logger.exception("could not hang up failed-passphrase caller")
-        streak = failed_calls.record_failure()
-        if streak >= MAX_FAILED_CALLS:
-            logger.critical("%d calls in a row failed the passphrase — "
-                            "someone is guessing", streak)
-            kill_worker()
-
-    async def _reject_no_phrase() -> None:
-        # unreachable when launched via __main__ (ensure_launch_phrase),
-        # but fail closed if the gate is on with nothing to check against
-        logger.error("%s required but not set — rejecting call", PHRASE_VAR)
-        try:
-            await ctx.api.room.delete_room(
-                lk_api.DeleteRoomRequest(room=ctx.room.name))
-        except Exception:
-            logger.exception("could not delete room (no passphrase set)")
-
-    async def _reject_tripped() -> None:
-        # the streak tripped but this worker is somehow still taking calls
-        # (shutdown not landed yet, or the signal failed) — refuse the call
-        # and pull the plug again
-        logger.critical("%d calls in a row failed the passphrase — "
-                        "refusing call and shutting down",
-                        failed_calls.count())
-        try:
-            await ctx.api.room.delete_room(
-                lk_api.DeleteRoomRequest(room=ctx.room.name))
-        except Exception:
-            logger.exception("could not delete room (failure lockout)")
-        kill_worker()
-
-    def _arm_lock() -> bool:
-        """Arm the gate. False means no phrase is configured — the caller
-        must be rejected (fail closed)."""
-        phrase = configured_phrase()
-        if not phrase:
-            return False
-        mate.lock(phrase, _hangup_failed_caller, on_unlock=_unlocked)
-        return True
-
-    greeted = False
-
-    def _gate_late_sip_joiner(participant) -> None:
-        # the allowlist's participant_connected handler covers stragglers;
-        # this one gives the same stragglers the passphrase gate. Already
-        # unlocked-by-phrase (or mid-prompt) sessions are left alone.
-        if sip_caller(participant.attributes) is None:
-            return
-        if (not passphrase_required() or mate.passphrase_passed
-                or mate.locked):
-            return
-        if failed_calls.count() >= MAX_FAILED_CALLS:
-            t = asyncio.create_task(_reject_tripped())
-            reject_tasks.add(t)
-            t.add_done_callback(reject_tasks.discard)
-            return
-        if not _arm_lock():
-            t = asyncio.create_task(_reject_no_phrase())
-            reject_tasks.add(t)
-            t.add_done_callback(reject_tasks.discard)
-            return
-        logger.info("SIP caller joined mid-session — arming passphrase gate")
-        if greeted:
-            t = asyncio.create_task(
-                session.say("G'day. What's the passphrase?"))
-            reject_tasks.add(t)
-            t.add_done_callback(reject_tasks.discard)
-
-    ctx.room.on("participant_connected", _gate_late_sip_joiner)
-
-    sip_present = any(sip_caller(p.attributes) is not None
-                      for p in ctx.room.remote_participants.values())
-    if sip_present and passphrase_required():
-        if failed_calls.count() >= MAX_FAILED_CALLS:
-            await _reject_tripped()
-            return
-        if not _arm_lock():
-            await _reject_no_phrase()
-            return
+    if not await screen.arm_initial_callers(
+            ctx.room.remote_participants.values()):
+        return
 
     if not mate.locked:
-        _start_watcher()
+        start_watcher()
 
     async def _stop_watcher():
         for w in watcher_holder:
             w.cancel()
+        if live_mode:
+            await mate.bridge.aclose()
 
     ctx.add_shutdown_callback(_stop_watcher)
 
-    await session.start(agent=mate, room=ctx.room)
+    if live_mode:
+        # Live audio has no matching LiveKit text-generation stream.
+        # Disable text/audio synchronization for the direct audio writer.
+        await session.start(agent=mate, room=ctx.room, room_options=room_io.RoomOptions(
+            text_input=False,
+            text_output=room_io.TextOutputOptions(sync_transcription=False),
+            delete_room_on_close=True,
+        ))
+    else:
+        await session.start(agent=mate, room=ctx.room)
     # deterministic greeting -- no LLM roll on the very first thing heard.
     # `greeted` flips first so a SIP straggler landing mid-greeting still
-    # gets a spoken passphrase prompt from _gate_late_sip_joiner.
-    greeted = True
+    # gets a spoken passphrase prompt from gate_late_sip_joiner.
+    screen.mark_greeted()
     if mate.locked:
         # no fleet details before the caller proves who they are
-        await session.say("G'day. What's the passphrase?")
+        await say("G'day. What's the passphrase?")
     else:
-        await session.say(f"G'day mate. {await fleet_greeting(herdr)}. "
-                          "What do you need?")
+        await say(f"G'day mate. {await fleet_greeting(herdr)}. "
+                  "What do you need?")
+        if live_mode:
+            await mate.bridge.start()
 
 
 def _require_allowlist(argv: list[str], env=None) -> None:

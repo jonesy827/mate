@@ -78,6 +78,11 @@ class FailedCalls:
             pass
 
     def record_failure(self) -> int:
+        # read-modify-write with no lock: two calls failing at the same
+        # moment can both read the same count and lose one increment.
+        # Accepted — the 3-strike threshold is a heuristic that slows a
+        # redialling guesser down, not an exact counter, and the in-call
+        # 3-miss hangup is unaffected either way.
         n = self.count() + 1
         self._save(n)
         return n

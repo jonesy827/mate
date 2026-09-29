@@ -45,13 +45,16 @@ class RecordingHerdr:
     async def deliver_task(self, pane_id, task):
         self.deliveries.append((pane_id, task))
 
-    async def nudge_enter(self, pane_id):
-        pass
+
+def make_mate(herdr):
+    """One fake plays both roles Mate talks to: the protocol client
+    (prompt_agent) and the delivery quirk layer (spawn, deliver_task)."""
+    return Mate(herdr, delivery=herdr)
 
 
 async def test_tell_agent_stages_without_sending():
     herdr = RecordingHerdr()
-    mate = Mate(herdr)
+    mate = make_mate(herdr)
     out = await mate.tell_agent(FakeCtx(["tell it to rerun the tests"]),
                                 pane_id="w1:p1", text="rerun the tests")
     assert "NOT SENT YET" in out
@@ -62,7 +65,7 @@ async def test_tell_agent_stages_without_sending():
 
 
 async def test_send_staged_with_nothing_staged():
-    mate = Mate(RecordingHerdr())
+    mate = make_mate(RecordingHerdr())
     out = await mate.send_staged(FakeCtx(["yes"]))
     assert out.startswith("ERROR")
     assert "nothing is staged" in out
@@ -70,7 +73,7 @@ async def test_send_staged_with_nothing_staged():
 
 async def test_turn_gate_blocks_without_new_user_turn():
     herdr = RecordingHerdr()
-    mate = Mate(herdr)
+    mate = make_mate(herdr)
     ctx = FakeCtx(["send hello to the agent"])
     await mate.tell_agent(ctx, pane_id="w1:p1", text="hello")
     out = await mate.send_staged(ctx)  # same history: no reply yet
@@ -81,7 +84,7 @@ async def test_turn_gate_blocks_without_new_user_turn():
 
 async def test_veto_word_blocks_even_with_send_in_transcript():
     herdr = RecordingHerdr()
-    mate = Mate(herdr)
+    mate = make_mate(herdr)
     await mate.tell_agent(FakeCtx(["first"]), pane_id="w1:p1", text="hello")
     out = await mate.send_staged(FakeCtx(["first", "no, don't send it"]))
     assert out.startswith("NOT SENT")
@@ -95,7 +98,7 @@ async def test_veto_word_blocks_even_with_send_in_transcript():
 
 async def test_unclear_reply_blocks():
     herdr = RecordingHerdr()
-    mate = Mate(herdr)
+    mate = make_mate(herdr)
     await mate.tell_agent(FakeCtx(["first"]), pane_id="w1:p1", text="hello")
     out = await mate.send_staged(FakeCtx(["first", "hmm what time is it"]))
     assert out.startswith("NOT SENT")
@@ -104,7 +107,7 @@ async def test_unclear_reply_blocks():
 
 async def test_clear_yes_delivers_staged_text_verbatim():
     herdr = RecordingHerdr()
-    mate = Mate(herdr)
+    mate = make_mate(herdr)
     await mate.tell_agent(FakeCtx(["first"]), pane_id="w1:p1",
                           text="check out the cleanup branch")
     out = await mate.send_staged(FakeCtx(["first", "yep"]))
@@ -119,7 +122,7 @@ async def test_clear_yes_delivers_staged_text_verbatim():
 
 async def test_restaging_overwrites_previous_stage():
     herdr = RecordingHerdr()
-    mate = Mate(herdr)
+    mate = make_mate(herdr)
     await mate.tell_agent(FakeCtx(["first"]), pane_id="w1:p1",
                           text="check out the clean branch")
     await mate.tell_agent(FakeCtx(["first", "no, the cleanup branch"]),
@@ -130,9 +133,39 @@ async def test_restaging_overwrites_previous_stage():
     assert herdr.prompts == [("w1:p1", "check out the cleanup branch")]
 
 
+async def test_stage_survives_a_few_intervening_turns():
+    # the user can hesitate or ask one thing in between; the read-back is
+    # still fresh enough at the limit
+    herdr = RecordingHerdr()
+    mate = make_mate(herdr)
+    await mate.tell_agent(FakeCtx(["first"]), pane_id="w1:p1", text="hello")
+    out = await mate.send_staged(
+        FakeCtx(["first", "hang on", "what was that", "yes send it"]))
+    assert out.startswith("delivered")
+    assert herdr.prompts == [("w1:p1", "hello")]
+
+
+async def test_stale_stage_expires_and_is_dropped():
+    # _staged is one slot: without this, a "yes" four turns later would
+    # deliver whatever was staged before the conversation moved on
+    herdr = RecordingHerdr()
+    mate = make_mate(herdr)
+    await mate.tell_agent(FakeCtx(["first"]), pane_id="w1:p1", text="hello")
+    history = ["first", "hang on", "what was that", "never mind", "yes"]
+    out = await mate.send_staged(FakeCtx(history))
+    assert out.startswith("NOT SENT")
+    assert "expired" in out
+    assert herdr.prompts == []
+    # dropped, not just refused: a fresh yes cannot resurrect it
+    out2 = await mate.send_staged(FakeCtx([*history, "yes send it"]))
+    assert out2.startswith("ERROR")
+    assert "nothing is staged" in out2
+    assert herdr.prompts == []
+
+
 async def test_discard_staged():
     herdr = RecordingHerdr()
-    mate = Mate(herdr)
+    mate = make_mate(herdr)
     await mate.tell_agent(FakeCtx(["first"]), pane_id="w1:p1", text="hello")
     out = await mate.discard_staged(None)
     assert "discarded" in out
@@ -143,7 +176,7 @@ async def test_discard_staged():
 
 async def test_spawn_task_rail_parallels_tell_agent():
     herdr = RecordingHerdr()
-    mate = Mate(herdr)
+    mate = make_mate(herdr)
     out = await mate.spawn_task(FakeCtx(["first"]),
                                 repo_path="/repo", branch="main",
                                 task="fix the tests")
@@ -164,7 +197,7 @@ async def test_spawn_task_harness_passthrough():
     # herdr hosts many agent kinds; the tool passes the (normalized) kind
     # through and the spoken staging line names non-default harnesses
     herdr = RecordingHerdr()
-    mate = Mate(herdr)
+    mate = make_mate(herdr)
     out = await mate.spawn_task(FakeCtx(["first"]), repo_path="/repo",
                                 branch="main", task="t", agent="Codex")
     assert "a codex agent" in out
@@ -187,7 +220,7 @@ async def test_tell_agent_queues_message_while_agent_boots():
             return {"panes": [], "workspaces": []}
 
     herdr = BootingHerdr()
-    mate = Mate(herdr)
+    mate = make_mate(herdr)
     mate.rail_enabled = False
     out = await mate.tell_agent(None, pane_id="wA:p1", text="start the task")
     assert "queued" in out and "still starting up" in out
@@ -204,7 +237,7 @@ async def test_agent_not_found_surfaces_from_send_staged():
             raise HerdrError("agent.prompt", "agent_not_found",
                              f"agent target {target} not found")
 
-    mate = Mate(NoAgentHerdr())
+    mate = make_mate(NoAgentHerdr())
     await mate.tell_agent(FakeCtx(["first"]), pane_id="w1:p1", text="hello?")
     out = await mate.send_staged(FakeCtx(["first", "yes"]))
     assert out.startswith("ERROR")
