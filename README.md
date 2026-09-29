@@ -1,367 +1,435 @@
-# mate
+# Mate
 
-Call a phone number and talk to "Mate". Mate drives a fleet of coding
-agents that run in [herdr](https://herdr.dev). You can spawn agents, give
-them tasks, and hear their results. I built this tool because I wanted to
-monitor and update my Claude Code sessions from the car. It is a working
-proof of concept with basic security. It has an MIT license and comes
-as-is.
+Mate lets you control coding agents through a phone call.
+The agents operate in [herdr](https://herdr.dev).
+You can start agents, send tasks, ask for status, and hear results.
+Mate can read Claude Code and Codex replies.
 
-Phone provisioning status (2026-09-27): the old Telnyx number
-`+12025550102` is deleted and must not be used. A replacement,
-`+12025550100`, is active in LiveKit directly. The `mate-calls` dispatch
-rule matches this number through its `numbers` field. A real inbound call
-reached Mate, passed authentication, and delivered speech to transcription.
-The CLI number-assignment endpoint returned an error and its assignment display
-remains empty; routing was configured through the SIP dispatch-rule API instead.
-The diagram below describes the original Telnyx deployment.
+Mate is an experimental application.
+Its security controls have limits.
+Read the security section before you connect a phone number.
 
+## System description
+
+Mate has two voice modes.
+The `MATE_VOICE_MODE` variable selects the mode.
+The default value is `local`.
+The current installation uses `live`.
+
+| Mode | Speech and model services |
+|---|---|
+| `live` | GPT-Live supplies conversation. The Luna model selects tools. Local services supply authentication and confirmation speech. |
+| `local` | Whisper changes speech to text. A language model selects tools. Kokoro changes text to speech. |
+
+The following diagram shows the current phone connection.
+
+```text
+Phone
+  → LiveKit phone number
+  → LiveKit room
+  → Mate worker
+      → GPT-Live conversation
+      → Luna tool selection
+      → Mate tools
+      → herdr Unix socket
+      → Coding agents
 ```
-your phone
-   │  PSTN
-   ▼
-Telnyx DID (+12025550102)
-   │  SIP trunk
-   ▼
-LiveKit Cloud SIP  (inbound trunk → dispatch rule → room mate-call-<caller>-<rand>)
-   │  WebRTC
-   ▼
-mate worker (this repo, runs on the workstation)
-   │  STT ⇄ LLM ⇄ TTS, local by default (LLM can also be the OpenAI API):
-   │    :8001 faster-whisper (STT)   :8003 llama.cpp qwen (LLM)   :8880 kokoro (TTS)
-   ▼
-herdr unix socket (~/.config/herdr/herdr.sock)
-   └─ workspaces/panes hosting claude-code agents
-```
 
-The media and infrastructure services are in `../matebridge-infra`. Its
-README gives the start procedure. No part of this project starts at boot.
+The worker operates on the workstation.
+A worker is the process that controls calls and supplies Mate tools.
+A pane is a terminal area in herdr.
+A transcript is a file that contains conversation records.
+A session ID identifies one agent conversation.
 
-## Confirmation rail
+The infrastructure project is at `../matebridge-infra`.
+Its README gives the service start procedures.
+This project does not install an automatic start service.
 
-The rules below describe the default `local` voice mode. The optional GPT-Live
-mode uses a contextual Luna approval classifier, described below.
+## Phone connection
 
-Voice transcription is not accurate. Because of this, one utterance never
-causes an outward action. The tools `tell_agent`, `spawn_task`, and
-`spawn_in_folder` stage the action and read it back. Delivery occurs only
-after a spoken yes in a **new** turn. The code does this check, not the
-LLM. A stage stays valid for three user turns. After that the code drops
-it, because a late yes answers a different question. The model must then
-stage the action and read it back again. TUI approvals that look
-destructive use the same rail. These approvals get one more check: the
-code reads the pane again immediately before it sends the keys. If that
-read fails, or if the destructive action is no longer on screen, the code
-drops the keys. This check is the same regex, not a comparison with the
-text that the user heard. Therefore the keys go only into a screen that
-still shows a destructive action. If the agent moves to a *different*
-destructive prompt inside the three-turn window, the keys go into that
-prompt. There is no bypass tool. "Guardrails off" is a voice toggle that
-the code also detects. It makes messages and spawns immediate. It never
-skips destructive approvals.
+The installation uses the LiveKit number **+12025550100**.
+The previous Telnyx number, `+12025550102`, no longer belongs to this installation.
+Do not use the previous number.
+
+The `mate-calls` dispatch rule contains the current number in its `numbers` field.
+A dispatch rule connects an incoming call to a LiveKit room.
+The number assignment command failed during setup.
+The dispatch-rule API supplied the connection instead.
+The CLI can show an empty assignment although incoming calls connect correctly.
+
+The installation has no outbound trunk.
+An outbound trunk connects LiveKit to a provider for outgoing calls.
+Mate has no callback feature.
+The planned Telnyx account upgrade is necessary before work on that connection can continue.
+
+### Configure another installation
+
+1. Obtain a phone number from LiveKit or a SIP provider.
+2. Configure the incoming call connection for your LiveKit project.
+3. Configure a dispatch rule for the Mate worker.
+4. Set `MATE_ALLOWED_NUMBERS` in `.env`.
+5. Set a passphrase in `.env`.
+6. Start the worker.
+7. Make a call to make sure that the connection operates correctly.
+
+A separate SIP provider also needs an inbound trunk.
+Set its number restrictions to agree with `MATE_ALLOWED_NUMBERS`, if the provider supports this control.
+Mate compares the caller number with its own allowlist.
+The current installation has no trunk allowlist requirement.
 
 ## Security
 
-The security is basic by design. This list gives the limits:
+**WARNING: Do not give the passphrase to a person without access approval.**
+**An authenticated caller can control agents with your workstation permissions.**
 
-- Two barriers stop hostile callers. The first barrier is the caller
-  allowlist (`MATE_ALLOWED_NUMBERS`). The worker enforces it fail-closed,
-  and the LiveKit trunk enforces it again. The second barrier is a spoken
-  four-word passphrase (`MATE_PASSPHRASE`), on by default. Callers can
-  spoof caller ID. The passphrase covers that risk.
-- The passphrase check runs in code on the raw transcript. Until the
-  check passes, the LLM does not run and each acting tool refuses. Mate
-  also speaks no fleet status before the check passes. After three failed
-  attempts, Mate ends the call. An attempt longer than 15 seconds counts
-  as a failed attempt. Thus one turn cannot contain many candidate
-  phrases. There is no default passphrase. You select your own passphrase
-  at setup. If three calls in a row end in a failed-passphrase hangup,
-  the worker shuts down. A state file keeps the streak count, so the
-  count survives across calls. The worker takes calls again after a
-  restart. Thus an attacker who redials gets a maximum of 9 guesses.
-- The rail catches bad transcription, not attackers. An attacker says yes
-  to their own staged action.
-- A caller on the allowlist drives agents with your full user
-  permissions. The destructive-prompt regex (`safety.py`) is a heuristic,
-  not a boundary.
-- The same regex guards the automatic Enter nudge. In a Claude Code
-  dialog, Enter accepts the selected option. Therefore mate reads the
-  pane first and skips the nudge if the agent is blocked, if the screen
-  shows a destructive action, or if the check fails.
-- If you set `LLM_API_KEY`, the hosted LLM receives call transcripts and
-  agent output. The default stack is fully local.
+Mate compares the caller number with `MATE_ALLOWED_NUMBERS`.
+An empty allowlist prevents the phone worker from starting.
+Mate rejects a SIP caller whose number is not in the allowlist.
+Caller ID is not proof of identity.
+An attacker can supply an incorrect caller number.
 
-## Running
+The passphrase supplies a second check.
+Four words are necessary in the default configuration.
+There is no default passphrase.
+Mate examines the transcript in application code.
+Before authentication succeeds, Mate refuses tool actions and gives no agent status.
+In Live mode, Mate does not open the GPT-Live connection before authentication succeeds.
 
-Before you start the worker:
+The passphrase check has these limits:
 
-1. Start the infrastructure services (see `../matebridge-infra`).
-2. Start llama.cpp: `systemctl --user start llama-qwen-long`.
-3. Start herdr: `tmux new-session -d -s herdr-host herdr`.
+- Three incorrect attempts stop the call.
+- An attempt longer than 15 seconds counts as a failure.
+- Three calls with incorrect authentication, one after the other, stop the worker.
+- A state file keeps the failure count between calls.
+- The next worker start sets that count to zero.
+
+Confirmation can prevent some transcription errors.
+It does not stop an authenticated attacker.
+An attacker can give approval for their own request.
+
+The destructive-action detector uses text patterns.
+These patterns recognize some Claude Code prompts.
+They do not identify all dangerous actions or all Codex permission prompts.
+They are not a security boundary.
+
+Live mode sends audio and agent data to OpenAI after authentication.
+Local mode can also use a hosted language model.
+That model receives the conversation text and tool data.
+The local services keep their own logs.
+
+## Configuration
+
+The example file gives the configuration variables.
+Git excludes `.env` and `.logs/`.
+
+1. Copy `.env.example` to `.env`.
+2. Set the file permissions to `600`.
+3. Enter your credentials and configuration values.
 
 ```sh
-.venv/bin/python -m mate.agent console   # desk test: terminal mic/speaker
-set -a && source .env && set +a
-.venv/bin/python -m mate.agent dev       # real worker: registers with LiveKit
+cp .env.example .env
+chmod 600 .env
 ```
 
-The worker does a preflight check of the LLM, STT, TTS, and herdr
-services. If one of these services is unreachable, the worker refuses to
-start. Obey these two rules:
-
-- Do not restart the worker during a call. First, make sure that the
-  output of `lk room list | grep mate-call-` is empty.
-- Dev mode imports the code again for each call. Thus edits usually apply
-  on the next call. If you must be sure, restart the worker between
-  calls.
-
-## Configuration (`.env`, gitignored, chmod 600)
-
-Copy `.env.example` to `.env`. The example file documents each variable.
-
-| var | purpose |
+| Variable | Function |
 |---|---|
-| `MATE_ALLOWED_NUMBERS` | **Required.** Comma-separated E.164 numbers that can call in. Mate ends other calls before it speaks. |
-| `MATE_PASSPHRASE` | **Required** unless disabled. Four words that each phone caller must speak before Mate acts. There is no default. If the variable is not set, the worker prompts for one at startup. |
-| `MATE_REQUIRE_PASSPHRASE` | Default `1`. Set `0` to run without the passphrase gate. |
-| `LIVEKIT_URL` / `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | LiveKit Cloud project credentials. |
-| `LLM_URL` `STT_URL` `TTS_URL` | Overrides for the local endpoints (defaults `:8003` `:8001` `:8880`). |
-| `LLM_MODEL` `STT_MODEL` `TTS_VOICE` | Model and voice overrides (default voice `af_heart`). |
-| `LLM_API_KEY` | Default `local`. To use the OpenAI API, set a real key, `LLM_URL=https://api.openai.com/v1`, and `LLM_MODEL`. The key is usage-billed. A ChatGPT subscription has no API access. |
-| `HERDR_SOCKET` | The herdr control socket (default `~/.config/herdr/herdr.sock`). |
-| `MATE_SRC_ROOTS` | Colon-separated roots that `spawn_in_folder` searches (default `~/src`). |
-| `MATE_CLAUDE_PROJECTS` | The Claude Code transcript directory (default `~/.claude/projects`). |
+| `MATE_ALLOWED_NUMBERS` | Required list of permitted caller numbers. Use E.164 format and commas between numbers. |
+| `MATE_PASSPHRASE` | Four-word passphrase. An interactive start can ask for this value if it is missing. |
+| `MATE_REQUIRE_PASSPHRASE` | Default: `1`. The value `0` disables the passphrase check. |
+| `LIVEKIT_URL` | LiveKit project address. |
+| `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` | LiveKit credentials. |
+| `MATE_VOICE_MODE` | Voice mode: `local` or `live`. |
+| `OPENAI_API_KEY` | OpenAI API key for Live mode. |
+| `MATE_LIVE_MODEL` | Live voice model. Default: `gpt-live-1`. |
+| `MATE_LIVE_VOICE` | Live voice. Default: `marin`. |
+| `MATE_BACKEND_MODEL` | Model that selects Live tools. Default: `gpt-6-luna`. |
+| `MATE_BACKEND_REASONING` | Reasoning effort for that model. Default: `none`. |
+| `LLM_URL` | Language model address for local mode. Default: `http://localhost:8003/v1`. |
+| `STT_URL` | Speech recognition address. Default: `http://localhost:8001/v1`. |
+| `TTS_URL` | Speech synthesis address. Default: `http://localhost:8880/v1`. |
+| `LLM_MODEL`, `STT_MODEL`, `TTS_VOICE` | Local model and voice selections. See `.env.example` for defaults. |
+| `LLM_API_KEY` | Language model credential for local mode. Default: `local`. |
+| `HERDR_SOCKET` | herdr socket path. Default: `~/.config/herdr/herdr.sock`. |
+| `MATE_SRC_ROOTS` | Project search directories. Use colons between paths. Default: `~/src`. |
+| `MATE_CLAUDE_PROJECTS` | Claude transcript directory. Default: `~/.claude/projects`. |
+| `MATE_CODEX_HOME` | Codex state directory override. If this value is missing, Mate uses `CODEX_HOME` or `~/.codex`. |
 
-## GPT-Live voice mode
+A hosted model in local mode needs three values: `LLM_URL`, `LLM_MODEL`, and `LLM_API_KEY`.
+A ChatGPT subscription does not supply API usage for Mate.
 
-Set `MATE_VOICE_MODE=live` and `OPENAI_API_KEY` in your environment to use
-GPT-Live for conversation with a managed Responses backend selecting Mate's
-tools. The default `local` mode remains available. This integration uses the
-Live WebSocket protocol directly; the pinned LiveKit OpenAI plugin's Realtime
-implementation uses a different protocol.
+The `MATE_APPROVAL_*` variables apply to the separate approval classifier experiment.
+Live calls do not use that classifier.
+They do not check its service during startup.
+
+## Start Mate
+
+### Prepare the services
+
+1. Start Whisper and Kokoro as specified in `../matebridge-infra`.
+2. Make sure that herdr is available.
+3. For local mode, start the selected language model service.
+
+Live mode does not need Qwen.
+The reference local installation uses the following Qwen service:
+
+```sh
+systemctl --user start llama-qwen-long
+```
+
+Start herdr only if no instance is available.
+The following command starts an instance in tmux:
+
+```sh
+tmux new-session -d -s herdr-host herdr
+```
+
+### Start the worker
+
+1. Load the configuration.
+2. Do the console test with a microphone and speaker.
+3. Stop the console test.
+4. Start the phone worker.
+
+```sh
+set -a
+source .env
+set +a
+
+.venv/bin/python -m mate.agent console
+# Stop the console test before you start the phone worker.
+.venv/bin/python -m mate.agent dev
+```
+
+The call process examines its necessary services before it starts a call.
+Live mode examines OpenAI, Whisper, Kokoro, and herdr.
+Local mode examines its language model, Whisper, Kokoro, and herdr.
+An unsuccessful check prevents the start of the call process.
+
+### Restart after a change
+
+1. Examine the output of `lk room list`.
+2. Make sure that no call is active.
+3. Stop the worker.
+4. Start the worker again.
+
+Do not restart the worker during a call.
+The installed LiveKit CLI does not automatically reload Python changes in `dev` mode.
+
+## Confirmation and delivery
+
+A staged action is a stored request that Mate did not send.
+Mate reads the request aloud before it asks for approval.
+The tools `tell_agent`, `spawn_task`, and `spawn_in_folder` normally create staged actions.
+The `send_staged` tool sends the stored action.
+The `discard_staged` tool removes it.
+
+### Live mode
+
+GPT-Live and its backend model interpret your approval.
+The backend is the Luna model that selects tools.
+After approval, it must call `send_staged`.
+A spoken statement that Mate sent a message does not prove delivery.
+
+These conditions are necessary for the application code:
+
+- Authentication succeeded for the caller.
+- The voice connection is available.
+- An action is staged.
+- The spoken confirmation stopped.
+
+Mate removes the staged action before the delivery attempt.
+A repeated call to `send_staged` cannot send that action again.
+After a correction, a new staged action and spoken confirmation are necessary.
+
+Live mode has no separate approval classifier or transcript timer.
+A fixed approval phrase is not necessary.
+Transcript fragments supply logs and context, but they do not control delivery.
+The models can incorrectly interpret approval.
+The application does not independently verify their interpretation.
+
+Live mode always uses confirmation.
+The local-mode command "guardrails off" does not disable it.
+For a staged destructive prompt, Mate reads the pane again before it sends keys.
+The screen must agree with the screen used for confirmation.
+
+### Local mode
+
+The application checks for approval in a subsequent user turn.
+It removes the staged action after more than three user turns that follow the request.
+The model must then stage the action again.
+
+The command "guardrails off" lets Mate send messages and start agents immediately.
+The command "guardrails on" makes confirmation necessary again for those actions.
+Neither command bypasses confirmation for a detected destructive prompt.
+
+Before destructive keys, Mate reads the pane again.
+It refuses delivery if it cannot read the screen or find the destructive pattern.
+Identical screen text is not necessary in local mode.
+Thus, this check can accept a different destructive prompt.
+
+### Delivery results and delays
+
+The `delivery.attempt` event identifies an attempt to send a Live action.
+The `delivery.result` event contains the returned result.
+A delivery result does not mean that the agent completed the task.
+If the delivery result is unknown, do not automatically send the action again.
+
+The `wait_for_agent` tool can wait up to 20 seconds for a reply.
+This wait can delay the spoken response after delivery.
+Long confirmation speech can also delay the next tool result.
+The current implementation has these delays.
+
+During a call, `FleetWatcher` announces blocked agents and completed delegated tasks.
+It waits for an indication that a delegated agent started work.
+If it observes no working state, it can do a completion check after 20 seconds.
+These announcements stop when the call stops.
+A coding agent can continue its task after the call stops.
+
+## Claude and Codex replies
+
+The `agent_report` tool first tries to read an agent transcript.
+Mate has readers for Claude and Codex transcript formats.
+It uses the agent type and exact session ID from herdr.
+If the snapshot omits the ID, Mate requests the pane details.
+Mate does not select a transcript by project directory, title, or modification time.
+
+The Claude reader uses this path:
 
 ```text
-Phone → LiveKit → GPT-Live (listening and speaking)
-                              ↕ delegation
-                         Responses backend
-                              ↕ function requests/results
-                         Mate Python tools → Herdr
-
-User approves readback → GPT-Live delegates → backend calls send_staged
+~/.claude/projects/<encoded-project-path>/<session-id>.jsonl
 ```
 
-`MATE_BACKEND_MODEL` selects the delegated model (default `gpt-6-luna`).
-`MATE_BACKEND_REASONING` defaults to `none`, the lowest supported effort.
-`MATE_LIVE_MODEL` defaults to `gpt-live-1`; `MATE_LIVE_VOICE` defaults to
-`marin`. An API key with access to both models is required. The startup model
-endpoint check verifies credentials; the Live session handshake verifies its
-configuration. A ChatGPT subscription does not supply API usage.
+The Codex reader uses the `state_5.sqlite` index to find the current transcript file.
+It opens the index for read access only.
+This index can identify a new file after a session resumes.
+Without a usable index, one file must match the exact session ID.
+Mate compares the session ID with the ID inside the file.
 
-Keep Whisper and Kokoro running for this mode; Qwen is no longer needed:
+The Codex reader returns final assistant answers.
+It does not include progress comments, tool records, reasoning records, or duplicate message IDs.
+It reads only the current transcript segment.
+It does not reconstruct earlier paginated history.
 
-- Authentication stays local. No Live connection opens until the caller
-  passes the existing passphrase gate. The passphrase is not sent to the
-  delegated model.
-- Ordinary conversation and fleet announcements use GPT-Live. Authentication
-  and exact action readbacks use local Kokoro so code knows the wording and
-  when playback finished. These short clips cannot be interrupted.
-- Whisper receives audio only while the passphrase gate is locked. After login,
-  GPT-Live handles conversation and interprets confirmation with its backend.
-  Transcript fragments are logged, but do not gate tools or delivery.
-- Sending is two steps: stage and read back the exact request, then call
-  `send_staged` after the user approves. Corrections restage the message and
-  trigger another readback; refusals discard it. There is no separate Luna
-  approval classifier, silence timer, phrase match, or transcript-turn expiry.
-  Luna remains the tool-selecting backend. Guardrails stay on in Live mode.
-- Code requires a completed readback, an authenticated live connection, and a
-  pending action. It consumes that action before attempting delivery, so repeats
-  cannot resend it. Interpreting the user's approval is now the voice/backend
-  models' responsibility, rather than an independent application check.
-- Destructive prompt approvals still re-read the pane and require the same
-  screen before sending keys. The local voice mode keeps its existing gate.
-- `delivery.attempt` and `delivery.result` record actual execution. A verbal
-  claim of success alone is not a delivery receipt. Unknown outcomes must not
-  be automatically retried.
+If the session ID, transcript, or final answer is unavailable, Mate reads the last 100 lines from the same pane.
+It identifies this text as a partial screen view.
+Status requests and completion announcements use this alternative automatically.
+You do not need to ask Mate to read the screen separately.
+An unsuccessful screen read returns an error.
 
-The optional approval classifier module and its `MATE_APPROVAL_*` configuration
-remain available for standalone experiments; Live calls no longer use or probe it.
+The `agent.report_fallback` event records why Mate used the screen.
+Existing panes without a session ID continue to use this alternative.
+The Herdr Codex `SessionStart` integration is installed on the reference workstation.
+Its configuration does not guarantee that an existing pane has a recorded ID.
+Mate does not restart coding sessions to obtain one.
 
-After configuring `.env` and starting the existing local services:
+## Call logs
 
-```sh
-set -a && source .env && set +a
-MATE_VOICE_MODE=live .venv/bin/python -m mate.agent console
-# Once the desk test passes, register for phone calls:
-MATE_VOICE_MODE=live .venv/bin/python -m mate.agent dev
-```
+Each call writes a log at `.logs/<job-id>.log`.
+The directory has permission mode `700`.
+Each log has permission mode `600`.
+Each file has a size limit of 2 MB, with two backup files.
+The number of call logs can increase over time.
 
-The desk test should cover interruptions, an agent status request, staging a
-message, “looks good,” “yes, but wait,” changing the task during confirmation,
-and a disconnected call. Verify what actually arrived in Herdr. Mocked tests
-exercise the transport and staged delivery without GPU inference or API calls;
-real voice behavior and interpretation of approval require this live test.
+The logs contain authenticated speech text, tool calls, durations, delivery results, and agent identifiers.
+They do not contain complete copies of all terminal results.
+Mate removes configured credential values and the passphrase from its audit messages.
+It suppresses SDK transcript debug messages.
+The separate Whisper service has its own log configuration.
 
-Each call writes a bounded trace to `.logs/<job-id>.log` (gitignored, private
-directory). The trace records authenticated user turns, Live speech fragments,
-delegation/response IDs, tool calls and timings, result sizes and outcomes,
-fleet agent IDs, report coverage, delivery attempts/results, and audio byte totals.
-Tool results containing terminal or transcript content are not copied in full.
-Configured credentials and the passphrase are redacted. SDK transcript debug
-messages are suppressed in Mate; authenticated turns are recorded instead.
-The separate Whisper service has its own logging configuration.
+1. List the logs with `ls -t .logs`.
+2. Select the required call ID.
+3. Read that file with `tail -f .logs/<job-id>.log`.
 
-Use `ls -t .logs` to find the latest call, then `tail -f .logs/<job-id>.log`.
-For an every-agent update, compare `fleet.coverage` with the `agent.report`
-events and check `live.speech` for what the voice model generated. Speech
-fragments show generated text, not proof that the caller heard all playback.
+For a request about every agent, compare `fleet.coverage` and `agent.report` events.
+The `live.speech` events show text that GPT-Live generated.
+They do not prove that the caller heard all audio.
 
-Run `.venv/bin/python scripts/smoke_live.py` for a paid synthetic API test of
-approvals, backend tool selection, and the Live handshake. It loads `.env`,
-executes no Herdr actions, and starts no GPU services.
+## Tools and implementation
 
-The 2026-09-27 API smoke run passed 20 approval cases, four backend selection
-cases, and a Live handshake using the actual tool schemas. Both Luna roles
-used `none` reasoning. Approval latency was 0.75 seconds median and 2.37 seconds
-maximum. This small synthetic evaluation supports the initial setting; it does
-not establish real-call accuracy or test microphone playback and interruptions.
+| Function | Tools |
+|---|---|
+| Agent status | `fleet_status`, `agent_report`, `read_pane`, `wait_for_agent` |
+| Stored agent locations | `list_known_agents`, `forget_agent` |
+| Tasks and agent starts | `tell_agent`, `spawn_task`, `spawn_in_folder` |
+| Terminal answers | `send_answer` |
+| Confirmation | `send_staged`, `discard_staged` |
 
-Audio and delegated fleet/tool data leave the workstation in Live mode.
-OpenAI bills voice session duration and backend usage separately. A dropped
-connection ends the voice session without automatic reconnection or tool
-replay, since an in-flight action's outcome may be unknown. Completed or
-already-delivered agent work continues independently.
+An agent start returns before task delivery is complete.
+A background task waits for the agent to become available.
+The delivery retry interval can extend to approximately 120 seconds.
 
-Protocol references: [Live WebSockets](https://developers.openai.com/api/docs/guides/voice-websockets?api=live),
-[delegation and tools](https://developers.openai.com/api/docs/guides/live-delegation),
-and [session transcripts](https://developers.openai.com/api/docs/guides/live-conversations).
+The herdr compatibility code uses protocol 19 as its reference.
+This reference is for herdr 0.8.0.
+A different protocol version causes a warning.
+It does not prevent startup.
 
-## Phone/SIP setup (one-time, as deployed)
+The delivery code contains alternatives for delayed launches and missing prompts.
+An idle coding agent must be in the pane before direct terminal input.
+Mate does not send a task directly into a bare shell or a blocked prompt.
+Mate does not send an extra Enter key after delivery.
 
-1. **Telnyx**: Buy a DID. Create a SIP trunk that points to the SIP URI
-   of your LiveKit Cloud project. Assign the DID to the trunk.
-2. **LiveKit Cloud** (`lk` configured for the project):
+| File | Function |
+|---|---|
+| `src/mate/agent.py` | Agent tools, local confirmation, and call setup. |
+| `src/mate/live.py` | GPT-Live connection, audio, and delegated tool calls. |
+| `src/mate/live_agent.py` | Live tools and confirmation. |
+| `src/mate/audit.py` | Call logs and credential removal. |
+| `src/mate/herdr_client.py` | herdr socket protocol. |
+| `src/mate/delivery.py` | Agent starts and delivery compatibility code. |
+| `src/mate/watcher.py` | Agent status observation and spoken updates. |
+| `src/mate/screening.py` | Caller checks and passphrase setup. |
+| `src/mate/allowlist.py` | Caller number comparison. |
+| `src/mate/passphrase.py` | Passphrase checks and failure counts. |
+| `src/mate/safety.py` | Local approval checks and destructive-action patterns. |
+| `src/mate/folders.py` | Project directory selection. |
+| `src/mate/transcripts.py` | Claude and Codex transcript readers. |
+| `src/mate/approval.py` | Separate approval classifier experiment. |
 
-   ```sh
-   lk sip inbound create trunk.json     # numbers: ["+12025550102"]
-   lk sip dispatch create dispatch.json # individual/caller → mate-call-_<caller>_<random>
-   ```
-3. Set `AllowedNumbers` on the trunk to match `MATE_ALLOWED_NUMBERS`.
-   Then start the worker.
+## Development checks
 
-Note: I stopped the self-hosted LiveKit test because it crashed this host
-twice. The infra README gives details.
-
-## Tools
-
-`src/mate/agent.py` defines the `Mate` agent:
-
-- **Fleet**: `fleet_status`, `read_pane`, `agent_report` (reads real
-  replies from the session transcript), `wait_for_agent`,
-  `list_known_agents` / `forget_agent`.
-- **Acting**: `tell_agent`, `spawn_task` (new worktree + branch),
-  `spawn_in_folder`, `send_answer` (TUI prompts).
-- **Rail**: `send_staged` / `discard_staged`.
-
-A spawn returns immediately. A background deliverer sends the task after
-the agent boots (maximum 120 s). `FleetWatcher` (in `watcher.py`)
-announces blocks and completions during the call. It speaks a sanitized
-two-sentence summary. A `Delegations` clock blocks "finished"
-announcements for panes that never showed activity, because herdr can
-still type in them. These panes get one guarded Enter nudge instead.
-
-## herdr notes (`delivery.py`)
-
-`herdr_client.py` speaks the protocol only. Every workaround lives in
-`delivery.py`, thus a herdr upgrade has one file to audit. The
-workarounds are tested against herdr 0.7.5 (protocol 17). mate never
-patches herdr. A test pins each item, and a protocol mismatch causes a
-log warning, not a refusal to start.
-
-- **Sanitized names**: The client folds agent names to
-  `^[a-z][a-z0-9_-]{0,31}$`.
-- **A slow boot is not a failed launch**: Prompt delivery retries
-  `agent_not_ready` for a maximum of 120 s. The `timeout_ms` value
-  extends the 30 s launch deadline of herdr.
-- **Stuck-launch fallback** (0.7.5 bug): A launch can stay in
-  `launch_pending` forever while the agent idles. After approximately
-  20 s of refusals, the client reads `agent.list`. If an idle agent owns
-  the pane, the client types the message directly into the pane. The
-  client never types into a bare shell. It also waits while the agent is
-  blocked, because the type-in ends with Enter, and Enter answers the
-  dialog that blocks the agent.
-- **Dropped-prompt fallback** (0.7.5 bug): On worktree panes,
-  `agent.prompt` reports success but types nothing. A landed prompt
-  increases `state_change_seq`. If the value stays frozen, the client
-  uses the same type-in fallback with the same guard.
-- **Guarded Enter nudge**: The paste guard of Claude Code sometimes eats
-  the Enter from herdr. Thus one bare Enter follows each delivery after
-  approximately 2 s. Enter is not safe in all conditions: in a permission
-  dialog it accepts the selected option. Therefore `guarded_nudge` first
-  reads `agent.list` and the last 40 lines of the pane. It skips the
-  Enter if the agent is blocked, if the screen shows a destructive
-  action, or if a check fails.
-
-### Other harnesses
-
-herdr hosts many agent kinds (`claude`, `codex`, `gemini`, and more).
-Spawns, messages, TUI answers, and status watching work for each kind.
-`spawn_task` and `spawn_in_folder` accept an `agent` kind. Transcript
-readback (`agent_report` and spoken summaries) needs a per-harness
-adapter in the `ADAPTERS` table in `transcripts.py`. Claude and Codex
-adapters are included. Missing transcripts automatically fall back to the pane screen. An
-adapter is a single function: it receives a cwd and a session ID, and it
-returns the last assistant replies. The destructive-prompt regex in
-`safety.py` matches the approval wording of Claude Code only.
-
-## Development
+Do these checks from the repository directory:
 
 ```sh
 .venv/bin/python -m pytest tests/ -q
 .venv/bin/ruff check src/ tests/
 ```
 
-CI runs both commands on each push. Each bug found in live use gets a
-pinning test. The test suite needs no network, no herdr, and no GPU.
+A GPU, a live herdr instance, and external API calls are not necessary for these tests.
+Local Unix sockets and executor threads are necessary for some tests.
+A restrictive sandbox can prevent these tests from completing.
+The GitHub workflow does the tests and lint checks for pull requests and pushes to `main`.
 
-| module | role |
-|---|---|
-| `agent.py` | The Mate voice agent: tools, rail, entrypoint. |
-| `herdr_client.py` | Async herdr socket client: protocol only. |
-| `delivery.py` | Spawn and task delivery: all herdr workarounds, plus the guarded Enter nudge. |
-| `watcher.py` | `FleetWatcher` and `Delegations`: spoken block and finish announcements. |
-| `screening.py` | Call screening: caller allowlist and passphrase-gate wiring. |
-| `folders.py` | Folder-name to path resolution for `spawn_in_folder`. |
-| `transcripts.py` | Claude and Codex transcript readers with exact session lookup. |
-| `safety.py` | Approval and veto detection for the rail. |
-| `allowlist.py` | Caller allowlist: normalization plus fail-closed matching. |
-| `passphrase.py` | Spoken-passphrase gate: matching plus launch requirement. |
-| `scripts/smoke_llm.py` | Quick sanity test of the local LLM. |
+The following script does a separate OpenAI API test:
+
+```sh
+.venv/bin/python scripts/smoke_live.py
+```
+
+This script loads `.env` and incurs API charges.
+It checks tool selection, the Live connection, and the separate approval classifier experiment.
+It sends no herdr actions and starts no GPU services.
+Its classifier checks do not use the current Live confirmation path.
+
+Before operational use, do a phone test of these conditions:
+
+- A status request.
+- A staged message and an approving reply.
+- A correction or refusal after confirmation speech.
+- Speech during a confirmation.
+- A disconnected call.
+- A Codex reply without session metadata.
+
+Compare each requested action with the result in herdr.
+Automated tests do not show recognition accuracy during a phone call.
+
+## Technical references
+
+- [Live WebSocket protocol](https://developers.openai.com/api/docs/guides/voice-websockets?api=live)
+- [Delegation and tools](https://developers.openai.com/api/docs/guides/live-delegation)
+- [Live transcripts](https://developers.openai.com/api/docs/guides/live-conversations)
+- [ASD-STE100 specification](https://www.asd-ste100.org/assets/files/ASD-STE100_ISSUE9.pdf)
 
 ## License
 
-MIT — see `LICENSE`.
-
-
-## Codex replies
-
-Mate supports Claude and Codex transcript readers. Codex lookup requires an
-exact native session ID from Herdr (`agent_session`), including a `pane.get`
-lookup when the snapshot omits it. It never chooses a thread by folder or title.
-Codex's read-only `state_5.sqlite` index locates the current rollout, including
-resumed sessions. Without that index, a unique matching rollout file is used.
-`MATE_CODEX_HOME` overrides the state directory (otherwise `CODEX_HOME` or
-`~/.codex`). The reader verifies the file's session identity and reads final
-assistant answers, excluding reasoning, tools, progress commentary, and duplicate
-message IDs. Only the current rollout segment is read; older paginated history
-is not reconstructed.
-
-If identity, transcript, or a final answer is unavailable, `agent_report` and
-completion announcements automatically use that pane's last 100 screen lines,
-clearly marked as a partial screen view. You no longer need to ask it to read
-the screen separately. Failed screen reads remain explicit errors. Audit event
-`agent.report_fallback` records why the fallback was used.
-
-Existing Codex panes without session metadata use this fallback. Herdr's Codex
-SessionStart integration is installed and enabled on this host, but the affected
-running pane has not reported an identity; this change does not restart coding
-sessions or guess which transcript belongs to them.
+Mate uses the MIT license.
+See [LICENSE](LICENSE).
