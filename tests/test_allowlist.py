@@ -16,10 +16,10 @@ from mate.allowlist import (
 
 @pytest.mark.parametrize("raw", [
     "+12025550102",
-    "+12025550102",
-    "+12025550102",
-    "+12025550102",
-    " +12025550102 ",
+    "+1 (202) 555-0102",
+    "12025550102",
+    "2025550102",
+    " +1 202.555.0102 ",
 ])
 def test_normalize_us_variants(raw):
     assert normalize_number(raw) == "+12025550102"
@@ -37,7 +37,7 @@ def test_normalize_garbage_is_empty(raw):
 # --- env parsing -------------------------------------------------------
 
 def test_allowed_callers_parses_and_normalizes():
-    env = {ENV_VAR: "+12025550102, 4055551234,, "}
+    env = {ENV_VAR: "+1 202 555 0102, 4055551234,, "}
     assert allowed_callers(env) == {"+12025550102", "+14055551234"}
 
 
@@ -54,8 +54,8 @@ ALLOWED = allowed_callers({ENV_VAR: "+12025550102"})
 
 def test_allowed_number_matches_across_formats():
     assert is_allowed("+12025550102", ALLOWED)
-    assert is_allowed("+12025550102", ALLOWED)
-    assert is_allowed("(+12025550102", ALLOWED)
+    assert is_allowed("12025550102", ALLOWED)
+    assert is_allowed("(202) 555-0102", ALLOWED)
 
 
 def test_unknown_number_blocked():

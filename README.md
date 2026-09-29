@@ -47,20 +47,14 @@ This project does not install an automatic start service.
 
 ## Phone connection
 
-The installation uses the LiveKit number **+12025550100**.
-The previous Telnyx number, `+12025550102`, no longer belongs to this installation.
-Do not use the previous number.
+Use a phone number assigned to your own LiveKit project or SIP provider.
+Keep actual phone numbers, project addresses, and dispatch identifiers in private configuration.
+Do not put these values in documentation or test fixtures.
+Use reserved example numbers, such as `+1 202 555 0100`, in public examples.
 
-The `mate-calls` dispatch rule contains the current number in its `numbers` field.
 A dispatch rule connects an incoming call to a LiveKit room.
-The number assignment command failed during setup.
-The dispatch-rule API supplied the connection instead.
-The CLI can show an empty assignment although incoming calls connect correctly.
-
-The installation has no outbound trunk.
 An outbound trunk connects LiveKit to a provider for outgoing calls.
 Mate has no callback feature.
-The planned Telnyx account upgrade is necessary before work on that connection can continue.
 
 ### Configure another installation
 
@@ -75,7 +69,7 @@ The planned Telnyx account upgrade is necessary before work on that connection c
 A separate SIP provider also needs an inbound trunk.
 Set its number restrictions to agree with `MATE_ALLOWED_NUMBERS`, if the provider supports this control.
 Mate compares the caller number with its own allowlist.
-The current installation has no trunk allowlist requirement.
+Mate does not need a trunk allowlist to enforce its own caller restrictions.
 
 ## Security
 
@@ -318,7 +312,7 @@ An unsuccessful screen read returns an error.
 
 The `agent.report_fallback` event records why Mate used the screen.
 Existing panes without a session ID continue to use this alternative.
-The Herdr Codex `SessionStart` integration is installed on the reference workstation.
+The Herdr Codex `SessionStart` integration can supply session IDs.
 Its configuration does not guarantee that an existing pane has a recorded ID.
 Mate does not restart coding sessions to obtain one.
 
